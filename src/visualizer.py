@@ -81,7 +81,7 @@ def draw_line(
 def create_signal_strip(
     signal: np.ndarray,
     width: int,
-    height: int = 40
+    height: int = 150
 ) -> np.ndarray:
     """
     Создаёт псевдо-2D изображение сигнала (растянутое по вертикали).
@@ -311,8 +311,8 @@ def visualize_result(
     # Размеры
     width = max(800, n_pixels * 3)
     header_height = 120
-    strip_height = 40
-    graph_height = 140
+    strip_height = 50
+    graph_height = 150
     axis_height = 25
     margin = 8
     
