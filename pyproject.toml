@@ -1,0 +1,30 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "EncoderDecoder"
+version = "0.1.0"
+authors = [
+    {name = "Ilia Bespyatyy", email = "ilia@bespyatyy.ru"},
+]
+description = "Encoder head modeling"
+readme = "README.md"
+requires-python = ">=3.10"
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Operating System :: OS Independent",
+]
+dependencies = [
+    "numpy>=1.20.0",
+    "scipy>=1.7.0",
+    "opencv-python>=4.5.0",
+    "click>=8.0.0",
+]
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["*"]
+
+[project.scripts]
+encoderdecoder = "src.main:main"
