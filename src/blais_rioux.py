@@ -179,9 +179,9 @@ def make_blais_rioux_kernel(order: int) -> np.ndarray:
     np.ndarray
         Ядро фильтра длиной 2*order + 1.
     """
-    k = np.arange(-order, order + 1, dtype=np.float64)
-    sum_sq = np.sum(k ** 2)
-    return k / sum_sq
+    k = np.array([-1] * order + [0] + [1] * order)
+    norm_l1 = np.sum(abs(k))
+    return k / norm_l1
 
 
 def correlate_mirror(signal: np.ndarray, kernel: np.ndarray) -> np.ndarray:
