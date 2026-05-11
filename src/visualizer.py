@@ -5,14 +5,15 @@ visualizer.py — Модуль визуализации через OpenCV
 1. Исходный сигнал как псевдо-2D изображение (оттенки серого)
 2. Размеченный сглаженный нормированный сигнал с восстановленными битами
 3. График первой производной D1 с разметкой фронтов
-4. График второй производной D2
+4. График второй производной D2 с координатной осью X
 
 Над графиками выводится диагностическая информация.
+Используется классическая цветовая гамма matplotlib.
 """
 
 import cv2
 import numpy as np
-from typing import Tuple, Optional
+from typing import Tuple, List, Optional
 
 from src.ccd_simulator import SimulatorConfig, SimulationResult, simulate_ccd
 from src.blais_rioux import (
@@ -21,28 +22,37 @@ from src.blais_rioux import (
 )
 
 
-# Строгая классическая гамма, BGR для OpenCV
-COLOR_BG = (255, 255, 255)         # white
-COLOR_TEXT = (32, 32, 32)          # near-black
-COLOR_TEXT_DIM = (110, 110, 110)   # medium gray
-COLOR_GRID = (200, 200, 200)       # light gray
+# Цвета matplotlib (BGR для OpenCV)
+# C0: синий, C1: оранжевый, C2: зелёный, C3: красный, C4: фиолетовый
+COLOR_BG = (255, 255, 255)          # Белый фон
+COLOR_TEXT = (30, 30, 30)           # Тёмный текст
+COLOR_TEXT_DIM = (100, 100, 100)    # Серый текст
+COLOR_GRID = (200, 200, 200)        # Светло-серая сетка
+COLOR_AXIS = (50, 50, 50)           # Тёмная ось
 
-COLOR_SIGNAL = (180, 119, 31)      # tab:blue
-COLOR_SMOOTHED = (14, 127, 255)    # tab:orange
-COLOR_LOCAL_NORM = (44, 160, 44)   # tab:green
-COLOR_RECOVERED = (40, 39, 214)    # tab:red
+# Matplotlib C0-C9 в BGR
+COLOR_C0 = (180, 119, 31)           # Синий (#1f77b4)
+COLOR_C1 = (14, 127, 255)           # Оранжевый (#ff7f0e)
+COLOR_C2 = (44, 160, 44)            # Зелёный (#2ca02c)
+COLOR_C3 = (40, 39, 214)            # Красный (#d62728)
+COLOR_C4 = (189, 103, 148)          # Фиолетовый (#9467bd)
+COLOR_C5 = (75, 86, 140)            # Коричневый (#8c564b)
+COLOR_C7 = (127, 127, 127)          # Серый (#7f7f7f)
 
-COLOR_D1 = (189, 103, 148)         # tab:purple
-COLOR_D2 = (75, 86, 140)           # tab:brown
-
-COLOR_TRUE_EDGE = (34, 189, 188)   # tab:olive
-COLOR_EDGE_RISING = (207, 190, 23) # tab:cyan
-COLOR_EDGE_FALLING = (194, 119, 227) # tab:pink
-
-COLOR_ROI = (127, 127, 127)        # tab:gray
-COLOR_THRESHOLD = (14, 127, 255)   # same orange as smoothed
-COLOR_ERROR = (40, 39, 214)        # same red as recovered
-COLOR_CORRECT = (44, 160, 44)      # same green as local_norm
+# Назначение цветов
+COLOR_SIGNAL = COLOR_C0             # Синий — основной сигнал
+COLOR_SMOOTHED = COLOR_C7           # Серый — сглаженный
+COLOR_LOCAL_NORM = COLOR_C0         # Синий — нормированный
+COLOR_RECOVERED = COLOR_C1          # Оранжевый — восстановленные биты
+COLOR_D1 = COLOR_C0                 # Синий — D1
+COLOR_D2 = COLOR_C4                 # Фиолетовый — D2
+COLOR_TRUE_EDGE = COLOR_C2          # Зелёный — истинные фронты
+COLOR_EDGE_RISING = COLOR_C1        # Оранжевый — фронт 0→1
+COLOR_EDGE_FALLING = COLOR_C4       # Фиолетовый — фронт 1→0
+COLOR_ROI = COLOR_C0                # Синий — ROI
+COLOR_THRESHOLD = COLOR_C5          # Коричневый — порог
+COLOR_ERROR = COLOR_C3              # Красный — ошибка
+COLOR_CORRECT = COLOR_C2            # Зелёный — верно
 
 
 def draw_text(
@@ -71,7 +81,7 @@ def draw_line(
 def create_signal_strip(
     signal: np.ndarray,
     width: int,
-    height: int = 100
+    height: int = 40
 ) -> np.ndarray:
     """
     Создаёт псевдо-2D изображение сигнала (растянутое по вертикали).
@@ -126,25 +136,6 @@ def draw_graph(
     """
     Отрисовка графика сигнала.
     
-    Parameters
-    ----------
-    img : np.ndarray
-        Изображение для отрисовки.
-    signal : np.ndarray
-        Сигнал для отображения.
-    y_offset : int
-        Смещение по Y (верх графика).
-    height : int
-        Высота области графика.
-    width : int
-        Ширина области графика.
-    color : Tuple[int, int, int]
-        Цвет линии.
-    y_range : Optional[Tuple[float, float]]
-        Диапазон по Y. Если None — автоматический.
-    line_width : int
-        Толщина линии.
-        
     Returns
     -------
     Tuple[float, float]
@@ -155,7 +146,6 @@ def draw_graph(
     
     if y_range is None:
         y_min, y_max = signal.min(), signal.max()
-        # Добавляем отступ
         margin = (y_max - y_min) * 0.1 + 1e-12
         y_min -= margin
         y_max += margin
@@ -192,14 +182,7 @@ def draw_vertical_line(
     dashed: bool = False,
     thickness: int = 1
 ) -> None:
-    """
-    Отрисовка вертикальной линии (фронт, ROI и т.д.).
-    
-    Parameters
-    ----------
-    x_pos : float
-        Позиция в координатах сигнала.
-    """
+    """Отрисовка вертикальной линии."""
     scale_x = width / n_pixels
     screen_x = int(x_pos * scale_x + scale_x / 2)
     
@@ -207,7 +190,6 @@ def draw_vertical_line(
         return
     
     if dashed:
-        # Пунктирная линия
         for y in range(y_offset, y_offset + height, 6):
             y_end = min(y + 3, y_offset + height)
             draw_line(img, screen_x, y, screen_x, y_end, color, thickness)
@@ -226,7 +208,7 @@ def draw_horizontal_line(
     color: Tuple[int, int, int],
     dashed: bool = True
 ) -> None:
-    """Отрисовка горизонтальной линии (порог и т.д.)."""
+    """Отрисовка горизонтальной линии."""
     normalized = (y_val - y_min) / (y_max - y_min + 1e-12)
     screen_y = int(y_offset + height - normalized * height)
     
@@ -239,6 +221,60 @@ def draw_horizontal_line(
             draw_line(img, x, screen_y, x_end, screen_y, color, 1)
     else:
         draw_line(img, 0, screen_y, width, screen_y, color, 1)
+
+
+def draw_vertical_grid_at_true_bits(
+    img: np.ndarray,
+    true_bit_centers: np.ndarray,
+    y_offset: int,
+    height: int,
+    width: int,
+    n_pixels: int,
+    color: Tuple[int, int, int]
+) -> None:
+    """Отрисовка вертикальной сетки по истинным центрам бит."""
+    scale_x = width / n_pixels
+    
+    for center in true_bit_centers:
+        screen_x = int(center * scale_x + scale_x / 2)
+        if 0 <= screen_x < width:
+            # Пунктирная линия
+            for y in range(y_offset, y_offset + height, 8):
+                y_end = min(y + 3, y_offset + height)
+                draw_line(img, screen_x, y, screen_x, y_end, color, 1)
+
+
+def draw_x_axis(
+    img: np.ndarray,
+    y_offset: int,
+    width: int,
+    n_pixels: int
+) -> None:
+    """Отрисовка координатной оси X с делениями."""
+    axis_y = y_offset
+    
+    # Основная линия оси
+    draw_line(img, 0, axis_y, width, axis_y, COLOR_AXIS, 1)
+    
+    # Определяем шаг меток
+    step = 10
+    
+    scale_x = width / n_pixels
+    
+    for px in range(0, n_pixels + 1, step):
+        screen_x = int(px * scale_x)
+        if screen_x >= width:
+            screen_x = width - 1
+        
+        # Засечка
+        draw_line(img, screen_x, axis_y, screen_x, axis_y + 5, COLOR_AXIS, 1)
+        
+        # Метка
+        label = str(px)
+        text_size = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.3, 1)[0]
+        text_x = screen_x - text_size[0] // 2
+        text_x = max(0, min(width - text_size[0], text_x))
+        draw_text(img, label, (text_x, axis_y + 15), COLOR_TEXT_DIM, 0.3)
 
 
 def bits_to_string(bits: np.ndarray) -> str:
@@ -276,16 +312,17 @@ def visualize_result(
     width = max(800, n_pixels * 3)
     header_height = 120
     strip_height = 40
-    graph_height = 150
-    margin = 10
+    graph_height = 140
+    axis_height = 25
+    margin = 8
     
-    total_height = header_height + strip_height + 3 * (graph_height + margin) + margin
+    total_height = header_height + strip_height + 3 * (graph_height + margin) + axis_height + margin
     
-    # Создаём изображение
+    # Создаём изображение с белым фоном
     img = np.full((total_height, width, 3), COLOR_BG, dtype=np.uint8)
     
     # === HEADER: Диагностическая информация ===
-    y = 20
+    y = 18
     
     # Строка 1: Параметры симуляции
     params_str = (
@@ -298,7 +335,7 @@ def visualize_result(
     )
     draw_text(img, params_str, (10, y), COLOR_TEXT_DIM, 0.35)
     
-    y += 18
+    y += 16
     # Строка 2: Параметры обработки
     proc_str = (
         f"Filter N={det.config.filter_order}  |  "
@@ -309,7 +346,7 @@ def visualize_result(
     )
     draw_text(img, proc_str, (10, y), COLOR_TEXT_DIM, 0.35)
     
-    y += 22
+    y += 20
     # Строка 3: Результаты
     period_err = ((det.measured_bit_period - det.bit_width_px) / det.bit_width_px * 100) if det.measured_bit_period > 0 else 0
     result_str = (
@@ -319,18 +356,18 @@ def visualize_result(
         f"Period: {det.measured_bit_period:.2f}px ({period_err:+.2f}%)  |  "
         f"ROI: [{det.roi_start:.1f} - {det.roi_end:.1f}]"
     )
-    color_acc = COLOR_CORRECT if det.accuracy >= 99 else (COLOR_THRESHOLD if det.accuracy >= 90 else COLOR_ERROR)
+    color_acc = COLOR_CORRECT if det.accuracy >= 99 else (COLOR_C5 if det.accuracy >= 90 else COLOR_ERROR)
     draw_text(img, result_str, (10, y), color_acc, 0.4)
     
-    y += 22
+    y += 20
     # Строка 4: Истинные биты
     true_bits_str = f"True:      {bits_to_string(sim_result.bits)}"
-    draw_text(img, true_bits_str, (10, y), COLOR_TRUE_EDGE, 0.35)
+    draw_text(img, true_bits_str, (10, y), COLOR_C2, 0.35)
     
     y += 16
     # Строка 5: Восстановленные биты
     rec_bits_str = f"Recovered: {bits_to_string(det.recovered_bit_values)}"
-    draw_text(img, rec_bits_str, (10, y), COLOR_RECOVERED, 0.35)
+    draw_text(img, rec_bits_str, (10, y), COLOR_C1, 0.35)
     
     # === PANEL 1: Исходный сигнал как 2D полоса ===
     panel1_y = header_height
@@ -340,23 +377,20 @@ def visualize_result(
     strip_img = create_signal_strip(signal_norm, width, strip_height)
     img[panel1_y:panel1_y + strip_height, :] = strip_img
     
-    # Подпись
-    draw_text(img, "Raw CCD Signal", (5, panel1_y + 12), COLOR_TEXT_DIM, 0.35)
+    # Рамка
+    cv2.rectangle(img, (0, panel1_y), (width - 1, panel1_y + strip_height - 1), COLOR_AXIS, 1)
     
     # === PANEL 2: Сглаженный и нормированный сигнал ===
     panel2_y = panel1_y + strip_height + margin
     
-    # Фон
-    cv2.rectangle(img, (0, panel2_y), (width, panel2_y + graph_height), COLOR_BG, -1)
-    
-    # Сетка
-    for i in range(5):
-        y_grid = panel2_y + int(i * graph_height / 4)
-        draw_line(img, 0, y_grid, width, y_grid, COLOR_GRID, 1)
+    # Вертикальная сетка по истинным центрам бит
+    draw_vertical_grid_at_true_bits(
+        img, sim_result.true_bit_centers, panel2_y, graph_height, width, n_pixels, COLOR_GRID
+    )
     
     # ROI
-    draw_vertical_line(img, det.roi_start, panel2_y, graph_height, width, n_pixels, COLOR_ROI, dashed=True)
-    draw_vertical_line(img, det.roi_end, panel2_y, graph_height, width, n_pixels, COLOR_ROI, dashed=True)
+    draw_vertical_line(img, det.roi_start, panel2_y, graph_height, width, n_pixels, COLOR_ROI, dashed=True, thickness=1)
+    draw_vertical_line(img, det.roi_end, panel2_y, graph_height, width, n_pixels, COLOR_ROI, dashed=True, thickness=1)
     
     # Сглаженный сигнал
     draw_graph(img, det.smoothed_signal, panel2_y, graph_height, width, COLOR_SMOOTHED, y_range=(0, 1))
@@ -367,8 +401,8 @@ def visualize_result(
     # Восстановленные битовые уровни
     scale_x = width / n_pixels
     for seg in det.bit_segments:
-        x1 = int(seg.start_pos * scale_x)
-        x2 = int(seg.end_pos * scale_x)
+        x1 = int(seg.start_pos * scale_x + scale_x / 2)
+        x2 = int(seg.end_pos * scale_x + scale_x / 2)
         y_level = panel2_y + graph_height - int(seg.bit_value * graph_height * 0.8) - int(graph_height * 0.1)
         draw_line(img, x1, y_level, x2, y_level, COLOR_RECOVERED, 2)
     
@@ -377,27 +411,27 @@ def visualize_result(
         color = COLOR_EDGE_RISING if edge.d1_value > 0 else COLOR_EDGE_FALLING
         draw_vertical_line(img, edge.position, panel2_y, graph_height, width, n_pixels, color, thickness=1)
     
-    draw_text(img, "Smoothed + LocalNorm + Recovered Bits", (5, panel2_y + 12), COLOR_TEXT_DIM, 0.35)
+    # Рамка
+    cv2.rectangle(img, (0, panel2_y), (width - 1, panel2_y + graph_height - 1), COLOR_AXIS, 1)
+    draw_text(img, "Smoothed + LocalNorm + Recovered", (5, panel2_y + 12), COLOR_TEXT_DIM, 0.32)
     
     # === PANEL 3: Первая производная D1 ===
     panel3_y = panel2_y + graph_height + margin
     
-    cv2.rectangle(img, (0, panel3_y), (width, panel3_y + graph_height), COLOR_BG, -1)
-    
-    # Сетка
-    for i in range(5):
-        y_grid = panel3_y + int(i * graph_height / 4)
-        draw_line(img, 0, y_grid, width, y_grid, COLOR_GRID, 1)
+    # Вертикальная сетка
+    draw_vertical_grid_at_true_bits(
+        img, sim_result.true_bit_centers, panel3_y, graph_height, width, n_pixels, COLOR_GRID
+    )
     
     # ROI
     draw_vertical_line(img, det.roi_start, panel3_y, graph_height, width, n_pixels, COLOR_ROI, dashed=True)
     draw_vertical_line(img, det.roi_end, panel3_y, graph_height, width, n_pixels, COLOR_ROI, dashed=True)
     
     # D1
-    y_min, y_max = draw_graph(img, det.first_derivative, panel3_y, graph_height, width, COLOR_D1)
+    y_min, y_max = draw_graph(img, det.first_derivative, panel3_y, graph_height, width, COLOR_D1, line_width=1)
     
     # Нулевая линия
-    draw_horizontal_line(img, 0, panel3_y, graph_height, width, y_min, y_max, COLOR_GRID, dashed=True)
+    draw_horizontal_line(img, 0, panel3_y, graph_height, width, y_min, y_max, COLOR_AXIS, dashed=False)
     
     # Порог
     draw_horizontal_line(img, det.peak_threshold, panel3_y, graph_height, width, y_min, y_max, COLOR_THRESHOLD, dashed=True)
@@ -408,34 +442,40 @@ def visualize_result(
         color = COLOR_EDGE_RISING if edge.d1_value > 0 else COLOR_EDGE_FALLING
         draw_vertical_line(img, edge.position, panel3_y, graph_height, width, n_pixels, color, thickness=1)
     
-    draw_text(img, f"D1 (Blais-Rioux N={det.config.filter_order})", (5, panel3_y + 12), COLOR_TEXT_DIM, 0.35)
+    # Рамка
+    cv2.rectangle(img, (0, panel3_y), (width - 1, panel3_y + graph_height - 1), COLOR_AXIS, 1)
+    draw_text(img, f"D1 (Blais-Rioux N={det.config.filter_order})", (5, panel3_y + 12), COLOR_TEXT_DIM, 0.32)
     
     # === PANEL 4: Вторая производная D2 ===
     panel4_y = panel3_y + graph_height + margin
     
-    cv2.rectangle(img, (0, panel4_y), (width, panel4_y + graph_height), COLOR_BG, -1)
-    
-    # Сетка
-    for i in range(5):
-        y_grid = panel4_y + int(i * graph_height / 4)
-        draw_line(img, 0, y_grid, width, y_grid, COLOR_GRID, 1)
+    # Вертикальная сетка
+    draw_vertical_grid_at_true_bits(
+        img, sim_result.true_bit_centers, panel4_y, graph_height, width, n_pixels, COLOR_GRID
+    )
     
     # ROI
     draw_vertical_line(img, det.roi_start, panel4_y, graph_height, width, n_pixels, COLOR_ROI, dashed=True)
     draw_vertical_line(img, det.roi_end, panel4_y, graph_height, width, n_pixels, COLOR_ROI, dashed=True)
     
     # D2
-    y_min, y_max = draw_graph(img, det.second_derivative, panel4_y, graph_height, width, COLOR_D2)
+    y_min, y_max = draw_graph(img, det.second_derivative, panel4_y, graph_height, width, COLOR_D2, line_width=1)
     
     # Нулевая линия
-    draw_horizontal_line(img, 0, panel4_y, graph_height, width, y_min, y_max, COLOR_GRID, dashed=True)
+    draw_horizontal_line(img, 0, panel4_y, graph_height, width, y_min, y_max, COLOR_AXIS, dashed=False)
     
     # Фронты (нули D2)
     for edge in det.detected_edges:
         color = COLOR_EDGE_RISING if edge.d1_value > 0 else COLOR_EDGE_FALLING
         draw_vertical_line(img, edge.position, panel4_y, graph_height, width, n_pixels, color, thickness=1)
     
-    draw_text(img, "D2 (zeros = edges)", (5, panel4_y + 12), COLOR_TEXT_DIM, 0.35)
+    # Рамка
+    cv2.rectangle(img, (0, panel4_y), (width - 1, panel4_y + graph_height - 1), COLOR_AXIS, 1)
+    draw_text(img, "D2 (zeros = edges)", (5, panel4_y + 12), COLOR_TEXT_DIM, 0.32)
+    
+    # === Координатная ось X ===
+    axis_y = panel4_y + graph_height + 2
+    draw_x_axis(img, axis_y, width, n_pixels)
     
     return img
 
