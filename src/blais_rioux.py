@@ -18,15 +18,15 @@ blais_rioux.py — Модуль обработки сигнала методом
 from dataclasses import dataclass, field
 from typing import List, Optional
 import numpy as np
-from scipy.ndimage import gaussian_filter1d, minimum_filter1d, maximum_filter1d, correlate1d
+from scipy.ndimage import gaussian_filter1d, maximum_filter1d, correlate1d
 
 
 @dataclass
-class BlaisRiouxConfig:
-    """Конфигурация детектора Blais-Rioux."""
+class BRConfig:
+    """Конфигурация BR."""
     
-    filter_order: int = 4
-    """Порядок КИХ фильтра (полудлина ядра): 2 или 4."""
+    filter_order: int = 2
+    """Порядок КИХ фильтра N (длина ядра 2N+1): 2 или 4."""
     
     peak_threshold_rel: float = 0.15
     """Порог |D1| относительно максимума (0..1)."""
@@ -34,13 +34,13 @@ class BlaisRiouxConfig:
     min_edge_distance_factor: float = 0.3
     """Минимальное расстояние между фронтами как доля от bit_width_px."""
     
-    bit_width_px: float = 7.5
+    bit_width_px: float = 5
     """Априорная ширина бита в пикселях."""
     
     smoothing_sigma: float = 0.5
-    """Сигма гауссова сглаживания перед дифференцированием."""
+    """Cглаживания перед дифференцированием."""
     
-    minmax_window_px: int = 20
+    minmax_window_px: int = 50
     """Ширина окна для скользящего min/max нормирования."""
 
 
@@ -53,9 +53,6 @@ class DetectedEdge:
     
     d1_value: float
     """Значение D1 в этой точке (знак = направление перехода)."""
-    
-    amplitude: float
-    """|D1| — сила фронта."""
 
 
 @dataclass
@@ -135,12 +132,6 @@ class EdgeDetectionResult:
     roi_end: float
     """Конец ROI."""
     
-    aligned_true_bits: np.ndarray
-    """Истинные биты, выровненные с восстановленными (в ROI)."""
-    
-    aligned_recovered_bits: np.ndarray
-    """Восстановленные биты, выровненные с истинными."""
-    
     bit_errors: int
     """Количество ошибок в битах."""
     
@@ -156,24 +147,24 @@ class EdgeDetectionResult:
     accuracy: float
     """Точность восстановления (%)."""
     
-    config: BlaisRiouxConfig = field(repr=False)
+    config: BRConfig = field(repr=False)
     """Конфигурация."""
 
 
-def make_blais_rioux_kernel(order: int) -> np.ndarray:
+def make_br_kernel(order: int) -> np.ndarray:
     """
-    Создаёт КИХ ядро Blais-Rioux для первой производной.
+    Создаёт КИХ ядро BR для первой производной.
     
-    h[k] = k / Σk², k ∈ [-N..N]
+    h[k] = k / sum|k|, k in {-1, 1}
     
-    Это моментный фильтр, дающий положительное значение при 
+    Моментный фильтр, дающий положительное значение при
     возрастании сигнала и отрицательное при убывании.
     
     Parameters
     ----------
     order : int
-        Порядок фильтра (полудлина ядра).
-        
+        Порядок фильтра.
+
     Returns
     -------
     np.ndarray
@@ -187,10 +178,7 @@ def make_blais_rioux_kernel(order: int) -> np.ndarray:
 def correlate_mirror(signal: np.ndarray, kernel: np.ndarray) -> np.ndarray:
     """
     Корреляция сигнала с ядром (зеркальные граничные условия).
-    
-    ВАЖНО: используем correlate, а не convolve, чтобы сохранить 
-    знак производной (convolve переворачивает ядро).
-    
+
     Parameters
     ----------
     signal : np.ndarray
@@ -226,23 +214,17 @@ def normalize_global(signal: np.ndarray) -> np.ndarray:
 
 def apply_minmax_normalization(
     signal: np.ndarray,
-    roi_start: float,
-    roi_end: float,
     window_size: int
 ) -> np.ndarray:
     """
     Минимаксная нормализация по скользящему окну внутри ROI.
     
-    normalized[i] = (signal[i] - running_min[i]) / (running_max[i] - running_min[i])
+    normalized[i] = (signal[i] - global_min) / (running_max[i] - global_min)
     
     Parameters
     ----------
     signal : np.ndarray
         Входной сигнал.
-    roi_start : float
-        Начало ROI.
-    roi_end : float
-        Конец ROI.
     window_size : int
         Ширина скользящего окна.
         
@@ -252,20 +234,17 @@ def apply_minmax_normalization(
         Нормализованный сигнал.
     """
     n = len(signal)
-    roi_start_idx = max(0, int(np.floor(roi_start)))
-    roi_end_idx = min(n - 1, int(np.ceil(roi_end)))
     
     # Скользящие min/max
-    running_min = minimum_filter1d(signal, size=window_size, mode='reflect')
+    global_min = min(signal)
     running_max = maximum_filter1d(signal, size=window_size, mode='reflect')
     
     # Нормализация только внутри ROI
     normalized = signal.copy()
-    for i in range(roi_start_idx, roi_end_idx + 1):
-        local_min = running_min[i]
-        local_max = running_max[i]
-        range_val = local_max - local_min + 1e-12
-        normalized[i] = (signal[i] - local_min) / range_val
+    for i in range(len(normalized)):
+        local_max = max(running_max[i], 0.5)
+        range_val = local_max - global_min + 1e-12
+        normalized[i] = (signal[i] - global_min) / range_val
     
     return normalized
 
@@ -297,13 +276,11 @@ def find_zero_crossings_d2(
     n = len(d2)
     
     for i in range(n - 1):
-        A = d2[i]
-        B = d2[i + 1]
-        
-        # Смена знака
-        if A * B < 0:
-            # Линейная интерполяция нуля
-            pos = i + A / (A - B)
+        left = d2[i]
+        right = d2[i + 1]
+
+        if left * right < 0:
+            pos = i + left / (left - right)
             
             # Интерполяция D1 в этой точке
             frac = pos - i
@@ -312,7 +289,6 @@ def find_zero_crossings_d2(
             edges.append(DetectedEdge(
                 position=pos,
                 d1_value=d1_at_pos,
-                amplitude=abs(d1_at_pos)
             ))
     
     return edges
@@ -351,7 +327,7 @@ def filter_by_min_distance(
         
         if dist < min_dist:
             # Оставляем более сильный фронт
-            if curr.amplitude > prev.amplitude:
+            if abs(curr.d1_value) > abs(prev.d1_value):
                 result[-1] = curr
         else:
             result.append(curr)
@@ -370,9 +346,9 @@ def build_bit_segments(
     Для каждого сегмента:
     - n_bits = round(distance / bit_width_px)
     - measured_period = distance / n_bits
-    - bit_value определяется по знаку D1 на НАЧАЛЬНОМ фронте:
-      - D1 > 0 → сигнал возрастает → переход 0→1 → после фронта бит = 1
-      - D1 < 0 → сигнал убывает → переход 1→0 → после фронта бит = 0
+    - bit_value определяется по знаку D1 на начальном фронте:
+      - D1 > 0 сигнал возрастает, переход 0->1, после фронта бит = 1
+      - D1 < 0  сигнал убывает, переход 1->0, после фронта бит = 0
     
     Parameters
     ----------
@@ -397,9 +373,7 @@ def build_bit_segments(
     for i, edge in enumerate(sorted_edges):
         next_edge = sorted_edges[i + 1] if i + 1 < len(sorted_edges) else None
         
-        # Значение бита ПОСЛЕ фронта определяется знаком D1:
-        # D1 > 0 означает сигнал возрастает, т.е. переход 0→1, после фронта бит = 1
-        # D1 < 0 означает сигнал убывает, т.е. переход 1→0, после фронта бит = 0
+        # Значение бита после фронта определяется знаком D1:
         bit_value = 1 if edge.d1_value > 0 else 0
         
         start_pos = edge.position
@@ -460,7 +434,7 @@ def compute_mean_measured_period(segments: List[BitSegment]) -> float:
     """
     Средний измеренный период по всем сегментам.
     
-    mean_period = Σ(distance_i) / Σ(n_bits_i)
+    mean_period = sum(distance_i) / sum(n_bits_i)
     
     Parameters
     ----------
@@ -485,7 +459,7 @@ def detect_edges_and_recover_bits(
     adc_signal: np.ndarray,
     true_bits: np.ndarray,
     true_edges: np.ndarray,
-    config: Optional[BlaisRiouxConfig] = None
+    config: Optional[BRConfig] = None
 ) -> EdgeDetectionResult:
     """
     Основная функция детектирования фронтов и восстановления бит.
@@ -498,8 +472,8 @@ def detect_edges_and_recover_bits(
         Истинные биты (для сравнения).
     true_edges : np.ndarray
         Истинные позиции фронтов (для сравнения).
-    config : BlaisRiouxConfig, optional
-        Конфигурация. Если None — используются значения по умолчанию.
+    config : BRConfig, optional
+        Конфигурация. Если None - используются значения по умолчанию.
         
     Returns
     -------
@@ -507,7 +481,7 @@ def detect_edges_and_recover_bits(
         Результат обработки.
     """
     if config is None:
-        config = BlaisRiouxConfig()
+        config = BRConfig()
     
     n_pixels = len(adc_signal)
     bit_width_px = config.bit_width_px
@@ -517,40 +491,40 @@ def detect_edges_and_recover_bits(
     
     # 2. Гауссово сглаживание
     signal_smoothed = gaussian_filter1d(signal_norm, sigma=config.smoothing_sigma)
+
+    # 3. Минимаксная нормализация внутри ROI
+    local_norm_signal = apply_minmax_normalization(
+        signal_smoothed, config.minmax_window_px
+    )
+
+    # 4. КИХ фильтр D1 (BR)
+    br_kernel = make_br_kernel(config.filter_order)
+    d1 = correlate_mirror(local_norm_signal, br_kernel)
     
-    # 3. КИХ фильтр D1 (Blais-Rioux) — используем КОРРЕЛЯЦИЮ, не свёртку!
-    br_kernel = make_blais_rioux_kernel(config.filter_order)
-    d1 = correlate_mirror(signal_smoothed, br_kernel)
-    
-    # 4. КИХ фильтр D2 = D1(D1)
+    # 5. КИХ фильтр D2 = D1(D1)
     d2 = correlate_mirror(d1, br_kernel)
     
-    # 5. Поиск нулей D2
+    # 6. Поиск нулей D2
     raw_edges = find_zero_crossings_d2(d2, d1)
     
-    # 6. Порог по амплитуде
-    max_amp = max((e.amplitude for e in raw_edges), default=0)
+    # 7. Порог по амплитуде
+    max_amp = max((abs(e.d1_value) for e in raw_edges), default=0)
     peak_threshold = max_amp * config.peak_threshold_rel
     
-    # 7. Фильтрация по амплитуде
-    filtered_by_amp = [e for e in raw_edges if e.amplitude >= peak_threshold]
+    # 8. Фильтрация по амплитуде
+    filtered_by_amp = [e for e in raw_edges if abs(e.d1_value) >= peak_threshold]
     
-    # 8. Фильтрация по минимальному расстоянию
+    # 9. Фильтрация по минимальному расстоянию
     min_dist = bit_width_px * config.min_edge_distance_factor
     filtered_edges = filter_by_min_distance(filtered_by_amp, min_dist)
     
-    # 9. ROI: от первого до последнего фронта
+    # 10. ROI: от первого до последнего фронта
     roi_start = 0.0
     roi_end = float(n_pixels - 1)
     if filtered_edges:
         positions = sorted(e.position for e in filtered_edges)
         roi_start = positions[0]
         roi_end = positions[-1]
-    
-    # 10. Минимаксная нормализация внутри ROI
-    local_norm_signal = apply_minmax_normalization(
-        signal_smoothed, roi_start, roi_end, config.minmax_window_px
-    )
     
     # 11. Построение сегментов бит
     bit_segments = build_bit_segments(filtered_edges, bit_width_px, roi_end)
@@ -572,58 +546,19 @@ def detect_edges_and_recover_bits(
             true_bits_in_roi.append(true_bits[i])
     true_bits_in_roi = np.array(true_bits_in_roi)
     
-    # 15. Выравнивание последовательностей
-    best_offset = 0
-    best_errors = float('inf')
-    max_offset = min(5, max(len(recovered_bit_values), len(true_bits_in_roi)) if len(recovered_bit_values) > 0 and len(true_bits_in_roi) > 0 else 1)
-    
-    for offset in range(-max_offset, max_offset + 1):
-        errors = 0
-        length = min(len(recovered_bit_values), len(true_bits_in_roi))
-        
-        for i in range(length):
-            ri = i + offset
-            if 0 <= ri < len(recovered_bit_values):
-                if recovered_bit_values[ri] != true_bits_in_roi[i]:
-                    errors += 1
-            else:
-                errors += 1
-        
-        errors += abs(len(recovered_bit_values) - len(true_bits_in_roi))
-        
-        if errors < best_errors:
-            best_errors = errors
-            best_offset = offset
-    
-    # Формирование выровненных последовательностей
-    aligned_true_bits = true_bits_in_roi.copy() if len(true_bits_in_roi) > 0 else np.array([])
-    aligned_recovered_bits = []
-    
-    for i in range(len(true_bits_in_roi)):
-        ri = i + best_offset
-        if 0 <= ri < len(recovered_bit_values):
-            aligned_recovered_bits.append(recovered_bit_values[ri])
-        else:
-            aligned_recovered_bits.append(-1)
-    
-    aligned_recovered_bits = np.array(aligned_recovered_bits)
-    
-    # 16. Подсчёт ошибок
+    # 15. Подсчёт ошибок
     bit_errors = 0
-    for i in range(len(aligned_true_bits)):
-        if i >= len(aligned_recovered_bits) or aligned_recovered_bits[i] == -1:
+    for i in range(len(true_bits_in_roi)):
+        if i >= len(recovered_bit_values):
             bit_errors += 1
-        elif aligned_recovered_bits[i] != aligned_true_bits[i]:
+        elif recovered_bit_values[i] != true_bits_in_roi[i]:
             bit_errors += 1
     
-    # Замена -1 на 0 для отображения
-    aligned_recovered_bits = np.where(aligned_recovered_bits == -1, 0, aligned_recovered_bits)
-    
-    # Точность
-    total_bits_in_roi = len(aligned_true_bits)
+    # 16. Точность
+    total_bits_in_roi = len(true_bits_in_roi)
     correct_bits = total_bits_in_roi - bit_errors
     accuracy = (correct_bits / total_bits_in_roi * 100) if total_bits_in_roi > 0 else 0.0
-    
+
     # 17. Ошибки позиционирования фронтов
     edge_errors = []
     used_detected = set()
@@ -664,8 +599,6 @@ def detect_edges_and_recover_bits(
         recovered_bit_values=recovered_bit_values,
         roi_start=roi_start,
         roi_end=roi_end,
-        aligned_true_bits=aligned_true_bits,
-        aligned_recovered_bits=aligned_recovered_bits,
         bit_errors=bit_errors,
         edge_errors=edge_errors,
         rms_edge_error=rms_edge_error,
@@ -682,7 +615,7 @@ if __name__ == "__main__":
     sim_config = SimulatorConfig(n_bits=16, seed=42)
     sim_result = simulate_ccd(sim_config)
     
-    br_config = BlaisRiouxConfig(bit_width_px=sim_config.bit_width_px)
+    br_config = BRConfig(bit_width_px=sim_config.bit_width_px)
     result = detect_edges_and_recover_bits(
         sim_result.adc_signal,
         sim_result.bits,

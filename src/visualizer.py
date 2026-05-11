@@ -1,7 +1,7 @@
 """
 visualizer.py — Модуль визуализации через Matplotlib
 
-Создаёт фигуру с пятью секциями:
+Создает фигуру с пятью секциями:
 1. Header: диагностическая информация
 2. Псевдо-2D изображение сигнала (оттенки серого)
 3. Нормализованный, сглаженный и восстановленный сигнал
@@ -19,13 +19,11 @@ from typing import Tuple, Optional
 
 from src.ccd_simulator import SimulatorConfig, SimulationResult, simulate_ccd
 from src.blais_rioux import (
-    BlaisRiouxConfig, EdgeDetectionResult, DetectedEdge,
+    BRConfig, EdgeDetectionResult, DetectedEdge,
     detect_edges_and_recover_bits,
 )
 
-# ---------------------------------------------------------------------------
 # Цветовая гамма (matplotlib defaults)
-# ---------------------------------------------------------------------------
 C0 = "#1f77b4"   # синий
 C1 = "#ff7f0e"   # оранжевый
 C2 = "#2ca02c"   # зелёный
@@ -48,10 +46,7 @@ COLOR_CORRECT     = C2
 COLOR_ERROR_COL   = "#d62728"
 
 
-# ---------------------------------------------------------------------------
 # Вспомогательные функции
-# ---------------------------------------------------------------------------
-
 def bits_to_string(bits: np.ndarray) -> str:
     return "".join(str(int(b)) for b in bits)
 
@@ -62,7 +57,6 @@ def _add_roi_and_true_bits(
     true_bit_centers: np.ndarray,
 ) -> None:
     """Добавляет вертикальные линии ROI и истинных центров бит на ось."""
-    ymin, ymax = ax.get_ylim()
     # Истинные центры бит (пунктир, очень светлые)
     for cx in true_bit_centers:
         ax.axvline(cx, color=COLOR_TRUE_BIT, lw=0.7, ls=(0, (3, 6)), zorder=1)
@@ -85,17 +79,14 @@ def _add_edge_markers(
             ax.plot(edge.position, dot_y, "o", color=color, ms=4, zorder=4)
 
 
-# ---------------------------------------------------------------------------
 # Основная функция визуализации
-# ---------------------------------------------------------------------------
-
 def visualize_result(
     sim_result: SimulationResult,
     detection_result: EdgeDetectionResult,
-    window_name: str = "Blais-Rioux Edge Detector",
+    window_name: str = "Цифровая модель",
 ) -> plt.Figure:
     """
-    Создаёт matplotlib-фигуру с визуализацией результатов.
+    Создает фигуру с визуализацией результатов.
 
     Parameters
     ----------
@@ -151,7 +142,7 @@ def visualize_result(
             "dimgray", 14,
         ),
         (
-            f"Порядок фильтра N={det.config.filter_order}  |  "
+            f"Порядок N={det.config.filter_order}  |  "
             f"Гран. нуля: {det.config.peak_threshold_rel*100:.0f}%  |  "
             f"Мин. дист.: {det.config.min_edge_distance_factor*100:.0f}%T  |  "
             f"Сглаж.: {det.config.smoothing_sigma:.1f} px  |  "
@@ -159,9 +150,9 @@ def visualize_result(
             "dimgray", 14,
         ),
         (
-            f"Точность: {det.accuracy:.1f}%  |  Переходов: {len(det.detected_edges)}  |  "
+            f"Точн.: {det.accuracy:.1f}%  |  Перех.: {len(det.detected_edges)}  |  "
             f"RMS: {det.rms_edge_error:.3f} px  |  "
-            f"Ср. период: {det.measured_bit_period:.2f} px ({period_err:+.2f}%)  |  "
+            f"Ср. T: {det.measured_bit_period:.2f} px ({period_err:+.2f}%)  |  "
             f"ROI: [{det.roi_start:.1f} – {det.roi_end:.1f}]",
             acc_color, 14,
         ),
@@ -200,7 +191,7 @@ def visualize_result(
     ax_2d.set_ylabel("ПЗС", fontsize=10, rotation=0, labelpad=26, va="center")
 
     # ===================================================================
-    # 3. Нормализованный + сглаженный + восстановленный сигнал
+    # 3. Нормализованный + восстановленный сигнал
     # ===================================================================
     ax_sig = fig.add_subplot(gs[2])
 
@@ -265,7 +256,7 @@ def visualize_result(
         Line2D([0], [0], color=COLOR_D1,        lw=1.4, label=f"D1 (N={det.config.filter_order})"),
         Line2D([0], [0], color=COLOR_THRESHOLD, lw=1.0, ls="--", label="Предел нуля"),
         Line2D([0], [0], color=COLOR_RISING,    lw=1.0, label="Переход 0->1"),
-        Line2D([0], [0], color=COLOR_FALLING,   lw=1.0, label="Пере 1->0"),
+        Line2D([0], [0], color=COLOR_FALLING,   lw=1.0, label="Переход 1->0"),
     ]
     ax_d1.legend(handles=leg_d1, fontsize=8, loc="upper right",
                  ncol=1, framealpha=0.85, edgecolor="lightgray")
@@ -289,7 +280,7 @@ def visualize_result(
 
     ax_d2.set_xlim(-0.5, n_px - 0.5)
     # Ось X с метками
-    x_ticks = list(range(0, n_px + 1, max(1, n_px // 20)))
+    x_ticks = list(range(0, n_px + 1, 5))
     ax_d2.set_xticks(x_ticks)
     ax_d2.tick_params(axis="x", labelsize=7)
     ax_d2.set_xlabel("Pixel", fontsize=10)
@@ -300,7 +291,7 @@ def visualize_result(
     leg_d2 = [
         Line2D([0], [0], color=COLOR_D2,      lw=1.4, label="D2"),
         Line2D([0], [0], color=COLOR_RISING,  lw=1.0, label="Переход 0->1"),
-        Line2D([0], [0], color=COLOR_FALLING, lw=1.0, label="Пере 1->0"),
+        Line2D([0], [0], color=COLOR_FALLING, lw=1.0, label="Переход 1->0"),
         Line2D([0], [0], color=COLOR_ROI,     lw=1.0, ls="--", label="ROI"),
         Line2D([0], [0], color=COLOR_TRUE_BIT,lw=0.7, ls=":", label="Истинные биты"),
     ]
@@ -331,58 +322,60 @@ def print_detailed_results(
     print("=" * 80)
 
     print("\n--- SIMULATION PARAMETERS ---")
-    print(f"  Bits: {config.n_bits}, BitWidth: {config.bit_width_px:.1f} px, "
-          f"Blur: {config.sigma_blur_px:.1f} px, Noise: {config.noise_sigma_adu:.0f} ADU, "
-          f"Vignette: {config.vignette_strength:.2f}, Seed: {config.seed}")
+    print(f"  Bits: {config.n_bits}")
+    print(f"  Bit width: {config.bit_width_px:.2f} px")
+    print(f"  Blur sigma: {config.sigma_blur_px:.2f} px")
+    print(f"  Noise sigma: {config.noise_sigma_adu:.1f} ADU")
+    print(f"  Vignette: {config.vignette_strength:.2f}")
+    print(f"  Pixels: {config.n_pixels}")
+    print(f"  Seed: {config.seed}")
 
     print("\n--- PROCESSING PARAMETERS ---")
-    print(f"  Filter N={det.config.filter_order}, "
-          f"Threshold: {det.config.peak_threshold_rel*100:.0f}%, "
-          f"MinDist: {det.config.min_edge_distance_factor*100:.0f}%T, "
-          f"Smooth: {det.config.smoothing_sigma:.1f} px, "
-          f"MinMax: {det.config.minmax_window_px} px")
+    print(f"  Filter order: N={det.config.filter_order}")
+    print(f"  Peak threshold: {det.config.peak_threshold_rel * 100:.1f}%")
+    print(
+        f"  Min edge distance: {det.config.min_edge_distance_factor * 100:.1f}% of T")
+    print(f"  Smoothing sigma: {det.config.smoothing_sigma:.2f} px")
+    print(f"  MinMax window: {det.config.minmax_window_px} px")
 
     print("\n--- DETECTION RESULTS ---")
-    period_err = (
-        (det.measured_bit_period - det.bit_width_px) / det.bit_width_px * 100
-        if det.measured_bit_period > 0 else 0.0
-    )
-    print(f"  Detected edges:  {len(det.detected_edges)}")
-    print(f"  Bit segments:    {len(det.bit_segments)}")
-    print(f"  Recovered bits:  {len(det.recovered_bit_values)}")
-    print(f"  ROI:             [{det.roi_start:.2f} - {det.roi_end:.2f}] px")
+    print(f"  Detected edges: {len(det.detected_edges)}")
+    print(f"  Bit segments: {len(det.bit_segments)}")
+    print(f"  Recovered bits: {len(det.recovered_bits)}")
+    print(f"  ROI: [{det.roi_start:.2f} - {det.roi_end:.2f}] px")
     print(f"  A priori bit width: {det.bit_width_px:.2f} px")
-    print(f"  Measured period: {det.measured_bit_period:.3f} px ({period_err:+.2f}%)")
-    print(f"  RMS edge error:  {det.rms_edge_error:.4f} px")
-    print(f"  Bit errors:      {det.bit_errors}")
-    print(f"  Accuracy:        {det.accuracy:.1f}%")
+    print(f"  Measured period: {det.measured_bit_period:.3f} px")
+    period_err = ((
+                              det.measured_bit_period - det.bit_width_px) / det.bit_width_px * 100) if det.measured_bit_period > 0 else 0
+    print(f"  Period deviation: {period_err:+.2f}%")
+    print(f"  RMS edge error: {det.rms_edge_error:.4f} px")
+    print(f"  Bit errors: {det.bit_errors}")
+    print(f"  Accuracy: {det.accuracy:.1f}%")
 
-    print("\n--- EDGE POSITIONS ---")
-    for i, edge in enumerate(det.detected_edges):
-        direction = "0→1" if edge.d1_value > 0 else "1→0"
-        print(f"  [{i:2d}] pos={edge.position:7.3f} px  D1={edge.d1_value:+.4f}  {direction}")
+    print("\n--- BIT SEGMENTS ---")
+    print(
+        f"  {'Idx':<4} {'Start':>8} {'End':>8} {'Dist':>7} {'nBits':>5} {'Period':>7} {'Bit':>4}")
+    print(
+        f"  {'-' * 4} {'-' * 8} {'-' * 8} {'-' * 7} {'-' * 5} {'-' * 7} {'-' * 4}")
+    for i, seg in enumerate(det.bit_segments):
+        print(
+            f"  {i:<4} {seg.start_pos:>8.2f} {seg.end_pos:>8.2f} {seg.distance:>7.2f} {seg.n_bits:>5} {seg.measured_period:>7.3f} {seg.bit_value:>4}")
+
+    print("\n--- RECOVERED BITS WITH POSITIONS ---")
+    print(f"  {'Idx':<4} {'Position':>10} {'Value':>6} {'Segment':>8}")
+    print(f"  {'-' * 4} {'-' * 10} {'-' * 6} {'-' * 8}")
+    for i, bit in enumerate(det.recovered_bits):
+        print(
+            f"  {i:<4} {bit.position:>10.3f} {bit.value:>6} {bit.segment_idx:>8}")
 
     print("\n--- BIT SEQUENCES ---")
     print(f"  True bits:      {bits_to_string(sim_result.bits)}")
     print(f"  Recovered bits: {bits_to_string(det.recovered_bit_values)}")
-    print(f"  Aligned true:   {bits_to_string(det.aligned_true_bits)}")
-    print(f"  Aligned recov:  {bits_to_string(det.aligned_recovered_bits)}")
-
-    print("\n--- COMPARISON (aligned) ---")
-    errors_str = ""
-    for i in range(len(det.aligned_true_bits)):
-        if i < len(det.aligned_recovered_bits):
-            errors_str += "." if det.aligned_true_bits[i] == det.aligned_recovered_bits[i] else "X"
-        else:
-            errors_str += "?"
-    print(f"  Errors:         {errors_str}")
-
-    print("\n" + "=" * 80)
 
 
 def run_visualization(
     sim_config: SimulatorConfig,
-    br_config: BlaisRiouxConfig,
+    br_config: BRConfig,
     show_window: bool = True,
     save_path: Optional[str] = None,
 ) -> Tuple[plt.Figure, SimulationResult, EdgeDetectionResult]:
@@ -393,7 +386,7 @@ def run_visualization(
     ----------
     sim_config : SimulatorConfig
         Конфигурация симуляции.
-    br_config : BlaisRiouxConfig
+    br_config : BRConfig
         Конфигурация детектора.
     show_window : bool
         Показывать интерактивное окно matplotlib.
@@ -442,7 +435,7 @@ if __name__ == "__main__":
         vignette_strength=0.25,
         seed=7,
     )
-    br_config = BlaisRiouxConfig(
+    br_config = BRConfig(
         filter_order=4,
         peak_threshold_rel=0.15,
         min_edge_distance_factor=0.3,
