@@ -54,11 +54,11 @@ def bits_to_string(bits: np.ndarray) -> str:
 def _add_roi_and_true_bits(
     ax: plt.Axes,
     det: "EdgeDetectionResult",
-    true_bit_centers: np.ndarray,
+    true_edges: np.ndarray,
 ) -> None:
     """Добавляет вертикальные линии ROI и истинных центров бит на ось."""
-    # Истинные центры бит (пунктир, очень светлые)
-    for cx in true_bit_centers:
+    # Истинные границы бит (пунктир, очень светлые)
+    for cx in true_edges:
         ax.axvline(cx, color=COLOR_TRUE_BIT, lw=0.7, ls=(0, (3, 6)), zorder=1)
     # ROI
     ax.axvline(det.roi_start, color=COLOR_ROI, lw=1.0, ls="--", alpha=0.8, zorder=2)
@@ -136,23 +136,23 @@ def visualize_result(
 
     lines = [
         (
-            f"Бит: {config.n_bits}  |  Ширина: {config.bit_width_px:.1f} px  |  "
-            f"Сглаж.: {config.sigma_blur_px:.1f} px  |  Шум: {config.noise_sigma_adu:.0f} ADU  |  "
-            f"Виньет.: {config.vignette_strength:.2f}  |  Seed: {config.seed}",
+            f"Бит: {config.n_bits} | Шир.: {config.bit_width_px:.1f} | "
+            f"Сглаж.: {config.sigma_blur_px:.1f} | Шум: {config.noise_sigma_adu:.0f} | "
+            f"Виньет.: {config.vignette_strength:.2f} | Дисторсия: {config.distort_coeff:.2f} | Seed: {config.seed}",
             "dimgray", 14,
         ),
         (
-            f"Порядок N={det.config.filter_order}  |  "
-            f"Гран. нуля: {det.config.peak_threshold_rel*100:.0f}%  |  "
-            f"Мин. дист.: {det.config.min_edge_distance_factor*100:.0f}%T  |  "
-            f"Сглаж.: {det.config.smoothing_sigma:.1f} px  |  "
-            f"Окно норм.: {det.config.minmax_window_px} px",
+            f"Порядок N={det.config.filter_order} | "
+            f"Гран. нуля: {det.config.peak_threshold_rel*100:.0f}% | "
+            f"Мин. дист.: {det.config.min_edge_distance_factor*100:.0f}%T | "
+            f"Сглаж.: {det.config.smoothing_sigma:.1f} | "
+            f"Окно норм.: {det.config.minmax_window_px}",
             "dimgray", 14,
         ),
         (
-            f"Точн.: {det.accuracy:.1f}%  |  Перех.: {len(det.detected_edges)}  |  "
-            f"RMS: {det.rms_edge_error:.3f} px  |  "
-            f"Ср. T: {det.measured_bit_period:.2f} px ({period_err:+.2f}%)  |  "
+            f"Точн.: {det.accuracy:.1f}% | Перех.: {len(det.detected_edges)} | "
+            f"RMS: {det.rms_edge_error:.3f} px | "
+            f"Ср. T: {det.measured_bit_period:.2f} px ({period_err:+.2f}%) | "
             f"ROI: [{det.roi_start:.1f} – {det.roi_end:.1f}]",
             acc_color, 14,
         ),
@@ -195,7 +195,7 @@ def visualize_result(
     # ===================================================================
     ax_sig = fig.add_subplot(gs[2])
 
-    _add_roi_and_true_bits(ax_sig, det, sim_result.true_bit_centers)
+    _add_roi_and_true_bits(ax_sig, det, sim_result.true_edges)
 
     ax_sig.plot(xs, det.local_norm_signal, color=COLOR_LOCAL_NORM, lw=1.4, label="LocalNorm", zorder=6)
 
@@ -232,7 +232,7 @@ def visualize_result(
     # ===================================================================
     ax_d1 = fig.add_subplot(gs[3])
 
-    _add_roi_and_true_bits(ax_d1, det, sim_result.true_bit_centers)
+    _add_roi_and_true_bits(ax_d1, det, sim_result.true_edges)
 
     ax_d1.plot(xs, det.first_derivative, color=COLOR_D1, lw=1.4, zorder=5, label="D1")
     ax_d1.axhline(0, color="black", lw=0.8, zorder=4)
@@ -266,7 +266,7 @@ def visualize_result(
     # ===================================================================
     ax_d2 = fig.add_subplot(gs[4])
 
-    _add_roi_and_true_bits(ax_d2, det, sim_result.true_bit_centers)
+    _add_roi_and_true_bits(ax_d2, det, sim_result.true_edges)
 
     ax_d2.plot(xs, det.second_derivative, color=COLOR_D2, lw=1.4, zorder=5, label="D2")
     ax_d2.axhline(0, color="black", lw=0.8, zorder=4)
@@ -327,6 +327,7 @@ def print_detailed_results(
     print(f"  Blur sigma: {config.sigma_blur_px:.2f} px")
     print(f"  Noise sigma: {config.noise_sigma_adu:.1f} ADU")
     print(f"  Vignette: {config.vignette_strength:.2f}")
+    print(f"  Distortion coeff: {config.distort_coeff:.2f}")
     print(f"  Pixels: {config.n_pixels}")
     print(f"  Seed: {config.seed}")
 
@@ -403,6 +404,7 @@ def run_visualization(
         sim_result.adc_signal,
         sim_result.bits,
         sim_result.true_edges,
+        sim_config.distort_coeff,
         br_config,
     )
 

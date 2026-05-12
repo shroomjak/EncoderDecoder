@@ -16,6 +16,7 @@ from src.visualizer import run_visualization
 @click.option('--blur', default=0.5, type=float, help='Размытие оптики')
 @click.option('--noise', default=100.0, type=float, help='Шум АЦП (ADU)')
 @click.option('--vignette', default=0.5, type=float, help='Сила виньетирования [0..1]')
+@click.option('--distort', default=0.1, type=float, help='Сила дисторсии [-1..1]')
 @click.option('--n-pixels', default=200, type=int, help='Количество пикселей ПЗС')
 @click.option('--seed', default=7, type=int, help='Seed для генератора случайных чисел')
 @click.option('--filter-order', default=2, type=click.Choice(['2', '4']), help='Порядок КИХ фильтра')
@@ -31,6 +32,7 @@ def main(
     blur: float,
     noise: float,
     vignette: float,
+    distort: float,
     n_pixels: int,
     seed: int,
     filter_order: str,
@@ -55,6 +57,7 @@ def main(
         sigma_blur_px=blur,
         noise_sigma_adu=noise,
         vignette_strength=vignette,
+        distort_coeff=distort,
         n_pixels=n_pixels,
         seed=seed
     )

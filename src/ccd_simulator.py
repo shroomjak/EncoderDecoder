@@ -43,6 +43,9 @@ class SimulatorConfig:
     
     vignette_strength: float = 0.25
     """Сила виньетирования: 0 — нет, 1 — максимальное (центр=1, края=0)."""
+
+    distort_coeff: float = 0.1
+    """Коэффициент дисторсии, <0 -- подушкообразная, >0 -- бочкообразная"""
     
     seed: Optional[int] = 7
     """Начальное значение генератора случайных чисел (None — случайный)."""
@@ -73,6 +76,13 @@ class SimulationResult:
     config: SimulatorConfig
     """Конфигурация, использованная для симуляции."""
 
+
+def distort_division(x, center, norm, k=0.0):
+    """
+    Модель дистории делением. k < 0 - бочкообразная, k > 0 - подушкообразная.
+    """
+    r = (x - center) / norm
+    return center + r / (1 + k * r**2) * norm
 
 def simulate_ccd(config: Optional[SimulatorConfig] = None) -> SimulationResult:
     """
@@ -107,16 +117,26 @@ def simulate_ccd(config: Optional[SimulatorConfig] = None) -> SimulationResult:
     # Ступенчатый профиль
     profile = np.zeros(total_sub, dtype=np.float64)
     true_edges = []
-    
+
+    center = config.n_pixels / 2
+    norm = center
+
     for i, b in enumerate(bits):
-        lo = x_start + i * config.bit_width_px
-        hi = lo + config.bit_width_px
+        shift = np.random.uniform(-0.1, 0.1)
+        raw_lo = x_start + i * config.bit_width_px + shift
+        raw_hi = raw_lo + config.bit_width_px + shift
+
+        # Дисторсия
+        lo = distort_division(raw_lo, center, norm, config.distort_coeff)
+        hi = distort_division(raw_hi, center, norm, config.distort_coeff)
         profile[(x_sub >= lo) & (x_sub < hi)] = float(b)
         # Коррекция -0.5: пиксель i представляет интеграл [i, i+1),
         # его центр в позиции i+0.5. Но signal[i] интерпретируется как позиция i.
         true_edges.append(lo - 0.5)
-    
-    true_edges.append(x_start + config.n_bits * config.bit_width_px - 0.5)
+
+    shift = np.random.uniform(-0.1, 0.1)
+    end = x_start + config.n_bits * config.bit_width_px + shift
+    true_edges.append(distort_division(end, center, norm, config.distort_coeff) - 0.5)
     true_edges = np.array(true_edges)
     true_bit_centers = (true_edges[:-1] + true_edges[1:]) / 2.0
 

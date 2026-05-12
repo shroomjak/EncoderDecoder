@@ -20,6 +20,7 @@ from typing import List, Optional
 import numpy as np
 from scipy.ndimage import gaussian_filter1d, maximum_filter1d, correlate1d
 
+from src.ccd_simulator import distort_division
 
 @dataclass
 class BRConfig:
@@ -338,6 +339,8 @@ def filter_by_min_distance(
 def build_bit_segments(
     edges: List[DetectedEdge],
     bit_width_px: float,
+    n_pixels: int,
+    distort_coeff: float,
     roi_end: float
 ) -> List[BitSegment]:
     """
@@ -379,9 +382,18 @@ def build_bit_segments(
         start_pos = edge.position
         end_pos = next_edge.position if next_edge else roi_end
         distance = end_pos - start_pos
+
+        # Коррекция на дисторсию
+        center = n_pixels / 2
+        norm = center
+        pos = (start_pos + end_pos) / 2
+        bit_width_px_distorted = (
+            distort_division(pos + bit_width_px, center, norm, distort_coeff) -
+            distort_division(pos, center, norm, distort_coeff)
+        )
         
         # Количество бит = округление (distance / априорная ширина)
-        n_bits = max(1, round(distance / bit_width_px))
+        n_bits = max(1, round(distance / bit_width_px_distorted))
         
         # Измеренный период
         measured_period = distance / n_bits
@@ -459,6 +471,7 @@ def detect_edges_and_recover_bits(
     adc_signal: np.ndarray,
     true_bits: np.ndarray,
     true_edges: np.ndarray,
+    distort_coeff: float,
     config: Optional[BRConfig] = None
 ) -> EdgeDetectionResult:
     """
@@ -482,17 +495,18 @@ def detect_edges_and_recover_bits(
     """
     if config is None:
         config = BRConfig()
-    
-    n_pixels = len(adc_signal)
+
     bit_width_px = config.bit_width_px
-    
+    n_pixels = len(adc_signal)
+    print(n_pixels)
+
     # 1. Глобальная нормализация
     signal_norm = normalize_global(adc_signal.astype(np.float64))
     
     # 2. Гауссово сглаживание
     signal_smoothed = gaussian_filter1d(signal_norm, sigma=config.smoothing_sigma)
 
-    # 3. Минимаксная нормализация внутри ROI
+    # 3. Минимаксная нормализация
     local_norm_signal = apply_minmax_normalization(
         signal_smoothed, config.minmax_window_px
     )
@@ -519,15 +533,17 @@ def detect_edges_and_recover_bits(
     filtered_edges = filter_by_min_distance(filtered_by_amp, min_dist)
     
     # 10. ROI: от первого до последнего фронта
-    roi_start = 0.0
-    roi_end = float(n_pixels - 1)
-    if filtered_edges:
-        positions = sorted(e.position for e in filtered_edges)
-        roi_start = positions[0]
-        roi_end = positions[-1]
+    roi_start = true_edges[0]
+    roi_end = true_edges[-1]
     
     # 11. Построение сегментов бит
-    bit_segments = build_bit_segments(filtered_edges, bit_width_px, roi_end)
+    bit_segments = build_bit_segments(
+        filtered_edges,
+        bit_width_px,
+        n_pixels,
+        distort_coeff,
+        roi_end
+    )
     
     # 12. Измеренный средний период
     measured_bit_period = compute_mean_measured_period(bit_segments)
@@ -536,28 +552,24 @@ def detect_edges_and_recover_bits(
     recovered_bits = extract_bits_with_positions(bit_segments)
     recovered_bit_values = np.array([b.value for b in recovered_bits])
     
-    # 14. Сопоставление с истинными битами в ROI
-    true_bit_centers = (true_edges[:-1] + true_edges[1:]) / 2.0
-    margin = bit_width_px * 0.5
-    
-    true_bits_in_roi = []
-    for i, c in enumerate(true_bit_centers):
-        if roi_start - margin <= c <= roi_end + margin:
-            true_bits_in_roi.append(true_bits[i])
-    true_bits_in_roi = np.array(true_bits_in_roi)
-    
     # 15. Подсчёт ошибок
-    bit_errors = 0
-    for i in range(len(true_bits_in_roi)):
-        if i >= len(recovered_bit_values):
-            bit_errors += 1
-        elif recovered_bit_values[i] != true_bits_in_roi[i]:
-            bit_errors += 1
-    
+    best_errors = len(recovered_bit_values) + 1
+    best_k = 0
+    for k in range(len(true_bits) - len(recovered_bit_values) + 1):
+        bit_errors = 0
+        for i in range(len(recovered_bit_values)):
+            if recovered_bit_values[i] != true_bits[i + k]:
+                bit_errors += 1
+        if best_errors > bit_errors:
+            best_errors = bit_errors
+            best_k = k
+
+    true_bits_aligned = true_bits[best_k:]
+
     # 16. Точность
-    total_bits_in_roi = len(true_bits_in_roi)
-    correct_bits = total_bits_in_roi - bit_errors
-    accuracy = (correct_bits / total_bits_in_roi * 100) if total_bits_in_roi > 0 else 0.0
+    total_bits = len(recovered_bit_values)
+    correct_bits = total_bits - best_errors
+    accuracy = (correct_bits / total_bits* 100) if total_bits > 0 else 0.0
 
     # 17. Ошибки позиционирования фронтов
     edge_errors = []
@@ -599,7 +611,7 @@ def detect_edges_and_recover_bits(
         recovered_bit_values=recovered_bit_values,
         roi_start=roi_start,
         roi_end=roi_end,
-        bit_errors=bit_errors,
+        bit_errors=best_errors,
         edge_errors=edge_errors,
         rms_edge_error=rms_edge_error,
         peak_threshold=peak_threshold,
@@ -614,12 +626,15 @@ if __name__ == "__main__":
     
     sim_config = SimulatorConfig(n_bits=16, seed=42)
     sim_result = simulate_ccd(sim_config)
-    
+
+    distort_coeff = sim_config.distort_coeff
+
     br_config = BRConfig(bit_width_px=sim_config.bit_width_px)
     result = detect_edges_and_recover_bits(
         sim_result.adc_signal,
         sim_result.bits,
         sim_result.true_edges,
+        distort_coeff,
         br_config
     )
     
