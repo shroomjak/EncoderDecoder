@@ -62,7 +62,7 @@ class SimulationResult:
     """Целочисленный сигнал АЦП [n_pixels], dtype=int32."""
     
     true_edges: np.ndarray
-    """Истинные позиции ВСЕХ фронтов (включая внешние) в пикселях ПЗС."""
+    """Истинные позиции всех фронтов (включая внешние) в пикселях ПЗС."""
     
     true_bit_centers: np.ndarray
     """Истинные центры битовых ячеек в пикселях ПЗС."""
@@ -122,7 +122,7 @@ def simulate_ccd(config: Optional[SimulatorConfig] = None) -> SimulationResult:
     norm = center
 
     for i, b in enumerate(bits):
-        shift = np.random.uniform(-0.1, 0.1)
+        shift = np.random.uniform(-0.05, 0.05)
         raw_lo = x_start + i * config.bit_width_px + shift
         raw_hi = raw_lo + config.bit_width_px + shift
 
