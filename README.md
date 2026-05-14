@@ -12,7 +12,7 @@
 ```bash
 uv venv
 source .venv/bin/activate
-pip install -e .
+uv pip install -e .
 ```
 
 ## Использование
