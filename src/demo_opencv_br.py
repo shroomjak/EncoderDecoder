@@ -405,13 +405,14 @@ def _detect_with_fixed_roi(
         shifted_rbits.append(_replace(rb, position=rb.position + shift))
 
     from dataclasses import replace as _replace
-    det = _replace(
-        det,
-        detected_edges=shifted_edges,
-        bit_segments=shifted_segs,
-        recovered_bits=shifted_rbits,
-        roi_start=det.roi_start + shift,
-        roi_end=det.roi_end + shift,
+    br_config_clipped = _replace(
+        br_config,
+        roi_start=None,  # авто — детектор сам найдёт по фронтам внутри clipped
+        roi_end=None,
+    )
+
+    det = detect_edges_and_recover_bits(
+        clipped, true_bits, clipped_edges, distort_coeff, br_config_clipped
     )
     return det
 
@@ -584,8 +585,6 @@ def run(args) -> None:
         bit_width_px=args.bit_width,
         smoothing_sigma=args.smoothing,
         minmax_window_px=args.minmax_window,
-        roi_start=args.roi_left,
-        roi_end=args.n_pixels - args.roi_right,
     )
 
     ranger = AutoRange()

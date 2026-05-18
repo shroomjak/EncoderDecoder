@@ -498,8 +498,6 @@ def detect_edges_and_recover_bits(
     adc_signal: np.ndarray,
     true_bits: np.ndarray,
     true_edges: np.ndarray,
-    roi_start: float,
-    roi_end: float,
     distort_coeff: float,
     config: Optional[BRConfig] = None
 ) -> EdgeDetectionResult:
