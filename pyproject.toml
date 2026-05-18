@@ -21,6 +21,7 @@ dependencies = [
     "opencv-python>=4.5.0",
     "matplotlib>=3.5.0",
     "click>=8.0.0",
+    "pyserial"
 ]
 
 [tool.setuptools.packages.find]
