@@ -28,7 +28,13 @@ class BRConfig:
     
     filter_order: int = 2
     """Порядок КИХ фильтра N (длина ядра 2N+1): 2 или 4."""
-    
+
+    roi_start: Optional[float] = None
+    """Начало ROI в пикселях. None — авто (позиция первого фронта)."""
+
+    roi_end: Optional[float] = None
+    """Конец ROI в пикселях. None — авто (позиция последнего фронта)."""
+
     peak_threshold_rel: float = 0.25
     """Порог |D1| относительно максимума (0..1)."""
     
@@ -341,6 +347,7 @@ def build_bit_segments(
     bit_width_px: float,
     n_pixels: int,
     distort_coeff: float,
+    roi_start: float,
     roi_end: float
 ) -> List[BitSegment]:
     """
@@ -369,45 +376,64 @@ def build_bit_segments(
     """
     if not edges:
         return []
-    
+
     sorted_edges = sorted(edges, key=lambda e: e.position)
     segments = []
-    
+
+    def _make_segment(
+            start_pos: float,
+            end_pos: float,
+            bit_value: int
+    ) -> Optional[BitSegment]:
+        """Вспомогательная: строит BitSegment с коррекцией дисторсии."""
+        distance = end_pos - start_pos
+        center = n_pixels / 2
+        pos = (start_pos + end_pos) / 2 + distort_coeff
+        bw_distorted = (
+                distort_division(pos + bit_width_px, center, center,
+                                 distort_coeff) -
+                distort_division(pos, center, center, distort_coeff)
+        )
+        if abs(distance) <= 0.5 * bw_distorted:
+            return None
+        n_bits = max(1, round(distance / bw_distorted))
+        return BitSegment(
+            start_pos=start_pos,
+            end_pos=end_pos,
+            bit_value=bit_value,
+            n_bits=n_bits,
+            distance=distance,
+            measured_period=distance / n_bits,
+        )
+
+    # ── Левая граница: roi_start → первый фронт ─────────────────────────────
+    # Если первый фронт нисходящий (D1 < 0), то до него сигнал был высоким → 1
+    # Если восходящий (D1 > 0) → до него сигнал был низким → 0
+    first_edge = sorted_edges[0]
+    left_bit = 1 if first_edge.d1_value < 0 else 0
+    seg = _make_segment(roi_start, first_edge.position, left_bit)
+    if seg is not None:
+        segments.append(seg)
+
+    # ── Внутренние сегменты: между соседними фронтами ───────────────────────
     for i, edge in enumerate(sorted_edges):
         next_edge = sorted_edges[i + 1] if i + 1 < len(sorted_edges) else None
-        
-        # Значение бита после фронта определяется знаком D1:
+        if next_edge is None:
+            break
         bit_value = 1 if edge.d1_value > 0 else 0
-        
-        start_pos = edge.position
-        end_pos = next_edge.position if next_edge else roi_end
-        distance = end_pos - start_pos
+        seg = _make_segment(edge.position, next_edge.position, bit_value)
+        if seg is not None:
+            segments.append(seg)
 
-        # Коррекция на дисторсию
-        center = n_pixels / 2
-        norm = center
-        pos = (start_pos + end_pos) / 2 + distort_coeff
-        bit_width_px_distorted = (
-            distort_division(pos + bit_width_px, center, norm, distort_coeff) -
-            distort_division(pos, center, norm, distort_coeff)
-        )
-        
-        # Количество бит = округление (distance / априорная ширина)
-        n_bits = max(1, round(distance / bit_width_px_distorted))
-        
-        # Измеренный период
-        measured_period = distance / n_bits
+    # ── Правая граница: последний фронт → roi_end ───────────────────────────
+    # Если последний фронт восходящий (D1 > 0), то после него сигнал высокий → 1
+    # Если нисходящий → 0
+    last_edge = sorted_edges[-1]
+    right_bit = 1 if last_edge.d1_value > 0 else 0
+    seg = _make_segment(last_edge.position, roi_end, right_bit)
+    if seg is not None:
+        segments.append(seg)
 
-        if abs(distance) > 0.5 * bit_width_px_distorted:
-            segments.append(BitSegment(
-                start_pos=start_pos,
-                end_pos=end_pos,
-                bit_value=bit_value,
-                n_bits=n_bits,
-                distance=distance,
-                measured_period=measured_period
-            ))
-    
     return segments
 
 
@@ -472,6 +498,8 @@ def detect_edges_and_recover_bits(
     adc_signal: np.ndarray,
     true_bits: np.ndarray,
     true_edges: np.ndarray,
+    roi_start: float,
+    roi_end: float,
     distort_coeff: float,
     config: Optional[BRConfig] = None
 ) -> EdgeDetectionResult:
@@ -531,24 +559,33 @@ def detect_edges_and_recover_bits(
     # 9. Фильтрация по минимальному расстоянию
     min_dist = bit_width_px * config.min_edge_distance_factor
     filtered_edges = filter_by_min_distance(filtered_by_amp, min_dist)
-    
-    # 10. ROI: от первого до последнего фронта
-    roi_start = filtered_edges[0].position
-    roi_end = filtered_edges[-1].position
-    
+
+    # 10. ROI: из конфига, если задано; иначе — авто по крайним фронтам
+    roi_start = (
+        float(config.roi_start)
+        if config.roi_start is not None
+        else filtered_edges[0].position
+    )
+    roi_end = (
+        float(config.roi_end)
+        if config.roi_end is not None
+        else filtered_edges[-1].position
+    )
+
     # 11. Построение сегментов бит
     bit_segments = build_bit_segments(
         filtered_edges,
         bit_width_px,
         n_pixels,
         distort_coeff,
-        roi_end
+        roi_start,
+        roi_end,
     )
     
-    # 12. Измеренный средний период
+    # 11. Измеренный средний период
     measured_bit_period = compute_mean_measured_period(bit_segments)
     
-    # 13. Извлечение бит с координатами
+    # 12. Извлечение бит с координатами
     recovered_bits = extract_bits_with_positions(bit_segments)
     recovered_bit_values = np.array([b.value for b in recovered_bits])
 
@@ -560,7 +597,7 @@ def detect_edges_and_recover_bits(
         longer = recovered_bit_values
         shorter = true_bits
 
-    # 15. Подсчёт ошибок: скользим shorter по longer
+    # 13. Подсчёт ошибок: скользим shorter по longer
     window = len(shorter)
     best_errors = window + 1
     best_k = 0
@@ -573,12 +610,12 @@ def detect_edges_and_recover_bits(
 
     longer_aligned = longer[best_k: best_k + window]
 
-    # 16. Точность
+    # 14. Точность
     total_bits = window
     correct_bits = total_bits - best_errors
     accuracy = (correct_bits / total_bits * 100) if total_bits > 0 else 0.0
 
-    # 17. Ошибки позиционирования фронтов
+    # 15. Ошибки позиционирования фронтов
     edge_errors = []
     used_detected = set()
     detected_positions = [e.position for e in filtered_edges]

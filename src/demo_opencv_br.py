@@ -153,6 +153,8 @@ def draw_header(
     filter_order: int,
     threshold_pct: float,
     has_ground_truth: bool = False,
+    roi_left: int = 0,
+    roi_right: int = 0,
 ) -> np.ndarray:
     """
     Справочная текстовая информация (аналог draw_header из demo_opencv).
@@ -170,9 +172,12 @@ def draw_header(
     lines: list[tuple[str, tuple, float, int]] = []
 
     # Строка 1: источник, строка, диапазон
+    roi_clip_str = ""
+    if roi_left > 0 or roi_right > 0:
+        roi_clip_str = f"  roi_clip=[{roi_left}..n-{roi_right}]"
     lines.append((
         f"source={packet.source_label}  row={packet.row_index}"
-        f"  range=[{lo:.1f}, {hi:.1f}]",
+        f"  range=[{lo:.1f}, {hi:.1f}]{roi_clip_str}",
         COLOR_MUTED, 0.44, 1
     ))
 
@@ -332,6 +337,84 @@ def draw_bit_panel(
     return canvas
 
 
+
+# ============================================================
+# ROI-clipping wrapper
+# ============================================================
+
+def _detect_with_fixed_roi(
+    pixels: np.ndarray,
+    true_bits: np.ndarray,
+    true_edges: np.ndarray,
+    distort_coeff: float,
+    br_config: "BRConfig",
+    roi_left: int,
+    roi_right: int,
+) -> "EdgeDetectionResult":
+    """
+    Обрезает сигнал до фиксированного ROI [roi_left : n-roi_right],
+    запускает детектор строго внутри этого окна, затем сдвигает
+    все позиции фронтов/сегментов обратно в исходные координаты.
+    """
+    n = len(pixels)
+    l = max(0, roi_left)
+    r = max(0, roi_right)
+    if l + r >= n:
+        raise ValueError(
+            f"roi_left={l} + roi_right={r} >= n_pixels={n}: ROI пустой"
+        )
+
+    # Срез сигнала
+    clipped = pixels[l : n - r] if r > 0 else pixels[l:]
+    clipped = clipped.astype(np.int32 if pixels.dtype.kind in "iu" else np.float64)
+
+    # Истинные фронты внутри ROI (сдвигаем координаты)
+    if len(true_edges):
+        mask = (true_edges >= l) & (true_edges <= n - 1 - r)
+        clipped_edges = true_edges[mask] - l
+    else:
+        clipped_edges = np.array([])
+
+    det = detect_edges_and_recover_bits(
+        clipped, true_bits, clipped_edges, distort_coeff, br_config
+    )
+
+    # Сдвиг координат обратно в пространство полного сигнала
+    shift = float(l)
+
+    # Фронты
+    shifted_edges = []
+    for e in det.detected_edges:
+        from dataclasses import replace as _replace
+        shifted_edges.append(_replace(e, position=e.position + shift))
+
+    # Сегменты бит
+    shifted_segs = []
+    for seg in det.bit_segments:
+        from dataclasses import replace as _replace
+        shifted_segs.append(_replace(
+            seg,
+            start_pos=seg.start_pos + shift,
+            end_pos=seg.end_pos + shift,
+        ))
+
+    # Восстановленные биты с позициями
+    shifted_rbits = []
+    for rb in det.recovered_bits:
+        from dataclasses import replace as _replace
+        shifted_rbits.append(_replace(rb, position=rb.position + shift))
+
+    from dataclasses import replace as _replace
+    det = _replace(
+        det,
+        detected_edges=shifted_edges,
+        bit_segments=shifted_segs,
+        recovered_bits=shifted_rbits,
+        roi_start=det.roi_start + shift,
+        roi_end=det.roi_end + shift,
+    )
+    return det
+
 # ============================================================
 # Сборка кадра
 # ============================================================
@@ -357,9 +440,22 @@ def compose_frame(
 
     has_gt = (packet.source_label == "simulation")
     hdr    = draw_header(packet, det, args.n_bits, lo, hi, width, header_h,
-                         filter_order, threshold_pct, has_ground_truth=has_gt)
+                         filter_order, threshold_pct, has_ground_truth=has_gt,
+                         roi_left=args.roi_left, roi_right=args.roi_right)
     strip  = draw_strip_2d(pixels, lo, hi, width, strip_h, invert=args.invert)
     bp     = draw_bit_panel(pixels, det, width, bit_h, n_px, lo, hi)
+
+    # Рисуем границы фиксированного ROI поверх strip и bit_panel
+    xmap = _x_mapper(n_px, width)
+    for clip_px, panel in ((args.roi_left, strip), (args.roi_left, bp),
+                            (n_px - 1 - args.roi_right, strip), (n_px - 1 - args.roi_right, bp)):
+        if clip_px <= 0 and panel is strip and args.roi_left == 0:
+            continue
+        if clip_px >= n_px - 1 and args.roi_right == 0:
+            continue
+        xx = xmap(clip_px)
+        h  = panel.shape[0]
+        cv2.line(panel, (xx, 0), (xx, h - 1), (0, 180, 80), 2, cv2.LINE_AA)
 
     return np.vstack([hdr, strip, bp])
 
@@ -367,26 +463,6 @@ def compose_frame(
 # ============================================================
 # Источники данных
 # ============================================================
-
-def run_simulation(args) -> FramePacket:
-    """Одиночный кадр из симулятора."""
-    cfg = SimulatorConfig(
-        n_bits=args.n_bits,
-        bit_width_px=args.bit_width,
-        sigma_blur_px=args.blur,
-        noise_sigma_adu=args.noise,
-        vignette_strength=args.vignette,
-        distort_coeff=args.distort,
-        n_pixels=args.n_pixels,
-        seed=args.seed,
-    )
-    result = simulate_ccd(cfg)
-    return FramePacket(
-        row_index=0,
-        pixels=result.adc_signal.astype(np.float32),
-        source_label="simulation",
-    ), result
-
 
 def matrix_packets(args):
     """Генератор пакетов из serial CSV (формат: row_index,px0,px1,...,pxN-1)."""
@@ -442,12 +518,12 @@ def build_argparser() -> argparse.ArgumentParser:
     # ---- Параметры симуляции ----
     sim = p.add_argument_group("Параметры симуляции (--source sim)")
     sim.add_argument("--n-bits",    type=int,   default=24,    help="Количество бит (default: 24)")
-    sim.add_argument("--bit-width", type=float, default=7.5,   help="Ширина бита, px (default: 7.5)")
+    sim.add_argument("--bit-width", type=float, default=6,   help="Ширина бита, px (default: 6)")
     sim.add_argument("--blur",      type=float, default=0.5,   help="Размытие оптики σ (default: 0.5)")
     sim.add_argument("--noise",     type=float, default=60.0,  help="Шум АЦП ADU (default: 60)")
     sim.add_argument("--vignette",  type=float, default=0.25,  help="Виньетирование 0..1 (default: 0.25)")
-    sim.add_argument("--distort",   type=float, default=0.1,   help="Дисторсия (default: 0.1)")
-    sim.add_argument("--n-pixels",  type=int,   default=200,   help="Пикселей ПЗС (default: 200)")
+    sim.add_argument("--distort",   type=float, default=0.0,   help="Дисторсия (default: 0.0)")
+    sim.add_argument("--n-pixels",  type=int,   default=128,   help="Пикселей ПЗС (default: 128)")
     sim.add_argument("--seed",      type=int,   default=7,     help="Random seed (default: 7)")
     sim.add_argument(
         "--animate", action="store_true",
@@ -478,8 +554,11 @@ def build_argparser() -> argparse.ArgumentParser:
         help="Окно min-max нормировки, px (default: 50)",
     )
 
+
     # ---- Параметры отображения ----
     disp = p.add_argument_group("Параметры отображения")
+    disp.add_argument("--roi-left",      type=int,   default=0,   help="Обрезка сигнала слева, пикселей (default: 0)")
+    disp.add_argument("--roi-right",     type=int,   default=0,   help="Обрезка сигнала справа, пикселей (default: 0)")
     disp.add_argument("--pixel-width",   type=int,   default=5,   help="Ширина одного пикселя ПЗС на экране (default: 5)")
     disp.add_argument("--header-height", type=int,   default=88,  help="Высота заголовка, px (default: 88)")
     disp.add_argument("--strip-height",  type=int,   default=40,  help="Высота 2D-полосы, px (default: 40)")
@@ -505,6 +584,8 @@ def run(args) -> None:
         bit_width_px=args.bit_width,
         smoothing_sigma=args.smoothing,
         minmax_window_px=args.minmax_window,
+        roi_start=args.roi_left,
+        roi_end=args.n_pixels - args.roi_right,
     )
 
     ranger = AutoRange()
@@ -523,11 +604,13 @@ def run(args) -> None:
             true_bits  = np.zeros(args.n_bits, dtype=np.int32)
             true_edges = np.array([])
             try:
-                det = detect_edges_and_recover_bits(
-                    pixels.astype(np.int32),
+                det = _detect_with_fixed_roi(
+                    pixels,
                     true_bits, true_edges,
                     0.0,
                     br_config,
+                    roi_left=args.roi_left,
+                    roi_right=args.roi_right,
                 )
             except Exception as e:
                 print(f"[WARN] Ошибка обработки: {e}")
@@ -574,12 +657,14 @@ def run(args) -> None:
         )
 
         try:
-            det = detect_edges_and_recover_bits(
-                sim_result.adc_signal,
+            det = _detect_with_fixed_roi(
+                sim_result.adc_signal.astype(np.float64),
                 sim_result.bits,
                 sim_result.true_edges,
                 sim_cfg.distort_coeff,
                 br_config,
+                roi_left=args.roi_left,
+                roi_right=args.roi_right,
             )
         except Exception as e:
             print(f"[WARN] Ошибка детектора: {e}")
