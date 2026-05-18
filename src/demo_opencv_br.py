@@ -356,6 +356,8 @@ def _detect_with_fixed_roi(
     запускает детектор строго внутри этого окна, затем сдвигает
     все позиции фронтов/сегментов обратно в исходные координаты.
     """
+    from dataclasses import replace as _replace
+
     n = len(pixels)
     l = max(0, roi_left)
     r = max(0, roi_right)
@@ -375,46 +377,29 @@ def _detect_with_fixed_roi(
     else:
         clipped_edges = np.array([])
 
+    # roi_start/roi_end из конфига неприменимы к обрезанному сигналу → сбрасываем
+    br_config_clipped = _replace(br_config, roi_start=None, roi_end=None)
+
     det = detect_edges_and_recover_bits(
-        clipped, true_bits, clipped_edges, distort_coeff, br_config
+        clipped, true_bits, clipped_edges, distort_coeff, br_config_clipped
     )
 
     # Сдвиг координат обратно в пространство полного сигнала
     shift = float(l)
 
-    # Фронты
-    shifted_edges = []
-    for e in det.detected_edges:
-        from dataclasses import replace as _replace
-        shifted_edges.append(_replace(e, position=e.position + shift))
+    shifted_edges = [_replace(e, position=e.position + shift) for e in det.detected_edges]
+    shifted_segs  = [_replace(s, start_pos=s.start_pos + shift, end_pos=s.end_pos + shift)
+                     for s in det.bit_segments]
+    shifted_rbits = [_replace(rb, position=rb.position + shift) for rb in det.recovered_bits]
 
-    # Сегменты бит
-    shifted_segs = []
-    for seg in det.bit_segments:
-        from dataclasses import replace as _replace
-        shifted_segs.append(_replace(
-            seg,
-            start_pos=seg.start_pos + shift,
-            end_pos=seg.end_pos + shift,
-        ))
-
-    # Восстановленные биты с позициями
-    shifted_rbits = []
-    for rb in det.recovered_bits:
-        from dataclasses import replace as _replace
-        shifted_rbits.append(_replace(rb, position=rb.position + shift))
-
-    from dataclasses import replace as _replace
-    br_config_clipped = _replace(
-        br_config,
-        roi_start=None,  # авто — детектор сам найдёт по фронтам внутри clipped
-        roi_end=None,
+    return _replace(
+        det,
+        detected_edges=shifted_edges,
+        bit_segments=shifted_segs,
+        recovered_bits=shifted_rbits,
+        roi_start=det.roi_start + shift,
+        roi_end=det.roi_end + shift,
     )
-
-    det = detect_edges_and_recover_bits(
-        clipped, true_bits, clipped_edges, distort_coeff, br_config_clipped
-    )
-    return det
 
 # ============================================================
 # Сборка кадра
