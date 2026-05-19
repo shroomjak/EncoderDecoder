@@ -257,27 +257,22 @@ def draw_bit_panel(
     lo: float, hi: float,
 ) -> np.ndarray:
     """
-    Нижняя панель: нормализованный сигнал + разметка битов и фронтов.
-    Аналог первого графика visualizer.py + draw_binary_panel из demo_opencv.
+    Нижняя панель: нормализованный сигнал + разметка восстановленных битов.
 
-    Содержит:
-    - Нормализованный сигнал (кривая)
-    - Границы ROI (вертикальные линии)
-    - Вертикальные линии фронтов (синие = 0→1, оранжевые = 1→0)
-    - Горизонтальные отрезки восстановленных битов (bit_segments)
-    - Метки «0» / «1» над каждым сегментом
-    - Дробные границы ячеек (светло-серые, как в draw_binary_panel)
+    Важное отличие от старой версии:
+    рисуются не только сегменты, а именно отдельные биты, включая частично
+    видимые крайние биты у ROI.
     """
     canvas = np.full((height, width, 3), 255, dtype=np.uint8)
     xmap   = _x_mapper(n_pixels, width, left_pad=0)
 
-    top_pad    = 4
-    bot_pad    = 4
-    plot_h     = height - top_pad - bot_pad
-    sig_top    = top_pad + int(plot_h * 0.05)
-    sig_bot    = top_pad + int(plot_h * 0.55)
-    bit_y_hi   = top_pad + int(plot_h * 0.65)  # y для бит = 1
-    bit_y_lo   = top_pad + int(plot_h * 0.90)  # y для бит = 0
+    top_pad  = 4
+    bot_pad  = 4
+    plot_h   = height - top_pad - bot_pad
+    sig_top  = top_pad + int(plot_h * 0.05)
+    sig_bot  = top_pad + int(plot_h * 0.55)
+    bit_y_hi = top_pad + int(plot_h * 0.65)  # y для бит = 1
+    bit_y_lo = top_pad + int(plot_h * 0.90)  # y для бит = 0
 
     # --- Сигнал ---
     norm = np.clip((pixels - lo) / max(hi - lo, 1e-6), 0.0, 1.0)
@@ -285,8 +280,14 @@ def draw_bit_panel(
     for i, v in enumerate(norm):
         y = int(round(sig_bot - v * (sig_bot - sig_top)))
         pts.append((xmap(i), y))
-    cv2.polylines(canvas, [np.array(pts, dtype=np.int32)],
-                  False, (80, 80, 80), 1, cv2.LINE_AA)
+    cv2.polylines(
+        canvas,
+        [np.array(pts, dtype=np.int32)],
+        False,
+        (80, 80, 80),
+        1,
+        cv2.LINE_AA,
+    )
 
     if det is None:
         return canvas
@@ -294,45 +295,111 @@ def draw_bit_panel(
     # --- ROI ---
     for roi_x in (det.roi_start, det.roi_end):
         xx = xmap(roi_x)
-        cv2.line(canvas, (xx, top_pad), (xx, height - bot_pad),
-                 COLOR_ROI, 1, cv2.LINE_AA)
+        cv2.line(
+            canvas,
+            (xx, top_pad),
+            (xx, height - bot_pad),
+            COLOR_ROI,
+            1,
+            cv2.LINE_AA,
+        )
 
-    # --- Границы ячеек (дробные) — светло-серые ---
-    centers = [seg.start_pos for seg in det.bit_segments]
-    if det.bit_segments:
-        centers.append(det.bit_segments[-1].end_pos)
-    for cx in centers:
-        xx = xmap(cx)
-        cv2.line(canvas, (xx, bit_y_hi - 6), (xx, height - bot_pad),
-                 COLOR_GRID, 1, cv2.LINE_AA)
+    # --- Строим видимые биты из bit_segments ---
+    visible_cells = []
+    cell_boundaries = []
 
-    # --- Восстановленные биты (горизонтальные отрезки) ---
-    for seg in det.bit_segments:
-        x1 = xmap(seg.start_pos)
-        x2 = xmap(seg.end_pos)
-        y_seg = bit_y_hi if seg.bit_value else bit_y_lo
+    for seg_idx, seg in enumerate(det.bit_segments):
+        if seg.n_bits <= 0:
+            continue
+        if seg.measured_period <= 1e-12:
+            continue
+        if seg.end_pos <= seg.start_pos:
+            continue
+
+        grid_start = (
+            seg.grid_start_pos
+            if getattr(seg, "grid_start_pos", None) is not None
+            else seg.start_pos
+        )
+
+        for i in range(seg.n_bits):
+            bit_start = grid_start + i * seg.measured_period
+            bit_end = bit_start + seg.measured_period
+
+            visible_start = max(bit_start, seg.start_pos)
+            visible_end = min(bit_end, seg.end_pos)
+
+            if visible_end - visible_start <= 1e-12:
+                continue
+
+            visible_cells.append((visible_start, visible_end, seg.bit_value, seg_idx))
+            cell_boundaries.append(visible_start)
+            cell_boundaries.append(visible_end)
+
+    # --- Границы видимых битовых ячеек ---
+    if cell_boundaries:
+        uniq = []
+        for b in sorted(cell_boundaries):
+            if not uniq or abs(b - uniq[-1]) > 1e-6:
+                uniq.append(b)
+
+        for bx in uniq:
+            xx = xmap(bx)
+            cv2.line(
+                canvas,
+                (xx, bit_y_hi - 6),
+                (xx, height - bot_pad),
+                COLOR_GRID,
+                1,
+                cv2.LINE_AA,
+            )
+
+    # --- Видимые восстановленные биты ---
+    for cell_start, cell_end, bit_value, _seg_idx in visible_cells:
+        x1 = xmap(cell_start)
+        x2 = xmap(cell_end)
+        y_seg = bit_y_hi if bit_value else bit_y_lo
+
         cv2.line(canvas, (x1, y_seg), (x2, y_seg), COLOR_RECOV, 2, cv2.LINE_AA)
-        # Метка «0» / «1»
-        mid_x = (x1 + x2) // 2 - 4
-        _put(canvas, str(seg.bit_value), mid_x, y_seg - 3,
-             color=COLOR_RECOV, scale=0.38, thickness=1)
 
-    # --- Фронты (вертикальные линии + кружки на кривой) ---
+        # Подпись бита, если ячейка достаточно широкая
+        if abs(x2 - x1) >= 8:
+            mid_x = (x1 + x2) // 2 - 4
+            _put(
+                canvas,
+                str(bit_value),
+                mid_x,
+                y_seg - 3,
+                color=COLOR_RECOV,
+                scale=0.38,
+                thickness=1,
+            )
+
+    # --- Фронты ---
     for edge in det.detected_edges:
         xx = xmap(edge.position)
         color = COLOR_RISING if edge.d1_value > 0 else COLOR_FALL
-        cv2.line(canvas, (xx, top_pad), (xx, height - bot_pad),
-                 color, 1, cv2.LINE_AA)
-        # Кружок на уровне сигнала
+        cv2.line(
+            canvas,
+            (xx, top_pad),
+            (xx, height - bot_pad),
+            color,
+            1,
+            cv2.LINE_AA,
+        )
+
         idx = int(round(edge.position))
         if 0 <= idx < len(norm):
             cy = int(round(sig_bot - norm[idx] * (sig_bot - sig_top)))
             cv2.circle(canvas, (xx, cy), 3, color, -1, cv2.LINE_AA)
 
-    # Рамка
-    cv2.rectangle(canvas, (0, top_pad), (width - 1, height - bot_pad),
-                  COLOR_EDGE, 1)
-    # Метка панели
+    cv2.rectangle(
+        canvas,
+        (0, top_pad),
+        (width - 1, height - bot_pad),
+        COLOR_EDGE,
+        1,
+    )
     _put(canvas, "Signal + bit recovery", 4, top_pad + 12, COLOR_MUTED, 0.38)
     return canvas
 
@@ -352,54 +419,47 @@ def _detect_with_fixed_roi(
     roi_right: int,
 ) -> "EdgeDetectionResult":
     """
-    Обрезает сигнал до фиксированного ROI [roi_left : n-roi_right],
-    запускает детектор строго внутри этого окна, затем сдвигает
-    все позиции фронтов/сегментов обратно в исходные координаты.
+    Запускает детектор на ПОЛНОМ сигнале, но с фиксированным ROI в координатах
+    исходного сигнала.
+
+    Это важно для текущей реализации blais_rioux:
+    крайние сегменты около ROI восстанавливаются внутри detect_edges_and_recover_bits(...)
+    только если roi_start/roi_end переданы явно. Физическая обрезка сигнала до ROI
+    ломает восстановление бит от края ROI до первого/последнего фронта.
     """
     from dataclasses import replace as _replace
 
     n = len(pixels)
     l = max(0, roi_left)
     r = max(0, roi_right)
+
     if l + r >= n:
         raise ValueError(
             f"roi_left={l} + roi_right={r} >= n_pixels={n}: ROI пустой"
         )
 
-    # Срез сигнала
-    clipped = pixels[l : n - r] if r > 0 else pixels[l:]
-    clipped = clipped.astype(np.int32 if pixels.dtype.kind in "iu" else np.float64)
+    roi_start = float(l)
+    roi_end = float(n - 1 - r)
 
-    # Истинные фронты внутри ROI (сдвигаем координаты)
-    if len(true_edges):
-        mask = (true_edges >= l) & (true_edges <= n - 1 - r)
-        clipped_edges = true_edges[mask] - l
-    else:
-        clipped_edges = np.array([])
+    signal = pixels.astype(np.float64)
 
-    # roi_start/roi_end из конфига неприменимы к обрезанному сигналу → сбрасываем
-    br_config_clipped = _replace(br_config, roi_start=None, roi_end=None)
+    # Передаём фиксированный ROI напрямую в детектор.
+    # Сигнал и истинные фронты остаются в полных координатах.
+    br_config_roi = _replace(
+        br_config,
+        roi_start=roi_start,
+        roi_end=roi_end,
+    )
 
     det = detect_edges_and_recover_bits(
-        clipped, true_bits, clipped_edges, distort_coeff, br_config_clipped
+        signal,
+        true_bits,
+        true_edges,
+        distort_coeff,
+        br_config_roi,
     )
 
-    # Сдвиг координат обратно в пространство полного сигнала
-    shift = float(l)
-
-    shifted_edges = [_replace(e, position=e.position + shift) for e in det.detected_edges]
-    shifted_segs  = [_replace(s, start_pos=s.start_pos + shift, end_pos=s.end_pos + shift)
-                     for s in det.bit_segments]
-    shifted_rbits = [_replace(rb, position=rb.position + shift) for rb in det.recovered_bits]
-
-    return _replace(
-        det,
-        detected_edges=shifted_edges,
-        bit_segments=shifted_segs,
-        recovered_bits=shifted_rbits,
-        roi_start=det.roi_start + shift,
-        roi_end=det.roi_end + shift,
-    )
+    return det
 
 # ============================================================
 # Сборка кадра
