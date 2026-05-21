@@ -563,13 +563,16 @@ def build_bit_segments(
 
 def extract_bits_with_positions(segments: List[BitSegment]) -> List[RecoveredBit]:
     """
-    Извлечение бит с координатами внутри видимой части сегмента.
+    Извлечение только ПОЛНОСТЬЮ видимых битов.
 
-    Важно для крайних сегментов у ROI:
-    битовая сетка может быть якорена вне ROI, поэтому начало полного бита
-    может лежать за пределами видимого сегмента. В recovered_bits нужно
-    добавлять все биты, которые пересекают сегмент, и ставить их позицию
-    в пределах видимой области сегмента.
+    Внутренняя битовая сетка сегмента может включать частично обрезанные биты
+    у границ ROI, но в recovered_bits должны попадать только те биты, которые
+    целиком лежат внутри видимой части сегмента.
+
+    Это важно для:
+    - расчёта угла;
+    - сравнения кодовых слов;
+    - отрисовки битов без краевых ошибок.
     """
     bits = []
 
@@ -587,21 +590,25 @@ def extract_bits_with_positions(segments: List[BitSegment]) -> List[RecoveredBit
             else seg.start_pos
         )
 
+        eps = max(1e-9, 1e-6 * seg.measured_period)
+
         for i in range(seg.n_bits):
             bit_start = grid_start + i * seg.measured_period
             bit_end = bit_start + seg.measured_period
 
-            # Видимая часть бита внутри сегмента
-            visible_start = max(bit_start, seg.start_pos)
-            visible_end = min(bit_end, seg.end_pos)
+            # В recovered_bits включаем только целый бит,
+            # полностью попавший в видимую часть сегмента.
+            is_full_bit_inside = (
+                bit_start >= seg.start_pos - eps and
+                bit_end <= seg.end_pos + eps
+            )
 
-            # Бит добавляется, если он реально пересекает видимый сегмент
-            if visible_end - visible_start <= 1e-12:
+            if not is_full_bit_inside:
                 continue
 
             bits.append(RecoveredBit(
                 value=seg.bit_value,
-                position=visible_start,
+                position=bit_start,
                 segment_idx=seg_idx
             ))
 

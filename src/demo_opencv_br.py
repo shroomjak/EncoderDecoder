@@ -23,7 +23,7 @@ import sys
 import time
 from dataclasses import dataclass
 from typing import Optional, Tuple
-
+import serial as _serial_module
 import cv2
 import numpy as np
 
@@ -31,23 +31,67 @@ import numpy as np
 # Попытка импортировать зависимости из пакета EncoderDecoder.
 # Скрипт предполагается запускать из корня репозитория EncoderDecoder.
 # ---------------------------------------------------------------------------
-try:
-    from src.ccd_simulator import SimulatorConfig, simulate_ccd
-    from src.blais_rioux import BRConfig, detect_edges_and_recover_bits, EdgeDetectionResult
-except ImportError:
-    print(
-        "[ERROR] Не найдены модули src.ccd_simulator / src.blais_rioux.\n"
-        "Запускайте скрипт из корня репозитория EncoderDecoder:\n"
-        "  python src/demo_opencv_br.py --source sim",
-        file=sys.stderr,
-    )
-    sys.exit(1)
+from src.ccd_simulator import SimulatorConfig, simulate_ccd
+from src.blais_rioux import BRConfig, detect_edges_and_recover_bits, EdgeDetectionResult
+from src.disk_angle_estimator import (
+    AngleEstimationResult,
+    build_code_angle_map,
+    estimate_disk_angle_from_result,
+)
 
-try:
-    import serial as _serial_module
-except ImportError:
-    _serial_module = None  # type: ignore
+# ============================================================
+# Постоянные параметры углового кодирования диска
+# ============================================================
 
+# Полная циклическая кодовая последовательность, нанесённая на диск.
+# ВАЖНО: заменить на реальную последовательность вашего диска.
+FULL_DISK_CODE_SEQUENCE = (
+    "100001011100001100100001101100001110100001111100010001100010010100"
+    "010011100010100100010101100010110100010111100011001100011010100011"
+    "011100011100100011101100011110100011111100100100101100100110100100"
+    "111100101001100101010100101011100101101100101110100101111100110011"
+    "100110101100110110100110111100111010100111011100111101100111110100"
+    "111111101010101101010111101011011101011101101011111101101101111101"
+    "1101111011111111"
+)
+
+# Полное число бит на кодовой дорожке диска.
+# Обычно равно len(FULL_DISK_CODE_SEQUENCE).
+TOTAL_CODE_BITS_ON_DISK = len(FULL_DISK_CODE_SEQUENCE)
+
+# Длина одного кодового слова, m.
+# Должно выполняться:
+#   1 <= CODEWORD_LENGTH_BITS <= TOTAL_CODE_BITS_ON_DISK
+# и все циклические слова длины m должны быть уникальны.
+CODEWORD_LENGTH_BITS = 9
+
+# Угловой период диска.
+ANGLE_PERIOD_DEG = 360.0
+
+# Центр ПЗС-матрицы в пикселях.
+# None означает использовать геометрический центр:
+#   (n_pixels - 1) / 2
+SENSOR_CENTER_PIXEL = None
+
+# Коэффициент пересчёта пикселей в градусы, k.
+#
+# Если задано число, используется оно:
+#   angle_abs = angle_code_center - ANGLE_PER_SENSOR_PIXEL_DEG * delta_px
+#
+# Если None, коэффициент оценивается автоматически по измеренному периоду бита:
+#   k = ANGLE_AXIS_SIGN * ANGLE_PERIOD_DEG / (TOTAL_CODE_BITS_ON_DISK * measured_bit_period_px)
+#
+# Для обратного направления оси можно:
+#   - либо поставить ANGLE_AXIS_SIGN = -1.0 при автоматическом k,
+#   - либо задать ANGLE_PER_SENSOR_PIXEL_DEG отрицательным числом.
+ANGLE_PER_SENSOR_PIXEL_DEG = None
+
+# Знак направления оси ПЗС относительно направления увеличения угла на диске.
+# Используется только если ANGLE_PER_SENSOR_PIXEL_DEG is None.
+ANGLE_AXIS_SIGN = -1.0
+
+# Если нужно временно отключить расчёт угла, поставить False.
+ENABLE_ANGLE_ESTIMATION = True
 
 # ============================================================
 # Вспомогательные типы
@@ -147,6 +191,7 @@ def normalize_pixels(pixels: np.ndarray, lo: float, hi: float,
 def draw_header(
     packet: FramePacket,
     det: Optional[EdgeDetectionResult],
+    angle_est: Optional["AngleEstimationResult"],
     n_bits_apriori: int,
     lo: float, hi: float,
     width: int, height: int,
@@ -157,11 +202,11 @@ def draw_header(
     roi_right: int = 0,
 ) -> np.ndarray:
     """
-    Справочная текстовая информация (аналог draw_header из demo_opencv).
+    Справочная текстовая информация.
 
-    Параметр has_ground_truth=True только для --source sim, где истинная
-    последовательность известна. При --source matrix метрики accuracy и
-    rms_edge_error не вычисляются и заменяются на N/A.
+    При наличии angle_est дополнительно выводится:
+    - средний оценённый угол
+    - circular std по окнам
     """
     hdr = np.full((height, width, 3), 245, dtype=np.uint8)
 
@@ -171,7 +216,6 @@ def draw_header(
 
     lines: list[tuple[str, tuple, float, int]] = []
 
-    # Строка 1: источник, строка, диапазон
     roi_clip_str = ""
     if roi_left > 0 or roi_right > 0:
         roi_clip_str = f"  roi_clip=[{roi_left}..n-{roi_right}]"
@@ -182,7 +226,6 @@ def draw_header(
     ))
 
     if det is not None:
-        # Строка 2: параметры алгоритма + ROI + период
         period_str = f"T={det.measured_bit_period:.3f} px ({period_err:+.2f}%)"
         lines.append((
             f"N={filter_order}  thr={threshold_pct:.0f}%  "
@@ -190,9 +233,7 @@ def draw_header(
             COLOR_TEXT, 0.44, 1
         ))
 
-        # Строка 3: детекция + метрики качества
         if has_ground_truth:
-            # Режим симуляции — accuracy и rms доступны
             acc_color = (COLOR_OK if det.accuracy >= 99.0
                          else COLOR_ERR if det.accuracy < 90.0
                          else COLOR_MUTED)
@@ -205,10 +246,8 @@ def draw_header(
                 acc_color, 0.44, 1
             ))
         else:
-            # Режим матрицы — истинный сигнал неизвестен, accuracy/rms N/A
-            n_exp  = n_bits_apriori
-            n_got  = len(det.recovered_bit_values)
-            # Оцениваем «совпадение» числа бит как косвенный индикатор
+            n_exp = n_bits_apriori
+            n_got = len(det.recovered_bit_values)
             count_color = COLOR_OK if n_got == n_exp else COLOR_ERR
             lines.append((
                 f"edges={len(det.detected_edges)}  "
@@ -218,7 +257,38 @@ def draw_header(
                 count_color, 0.44, 1
             ))
 
-        # Строка 4: восстановленная последовательность
+        if angle_est is None:
+            lines.append((
+                "Angle: N/A",
+                COLOR_MUTED, 0.44, 1
+            ))
+        elif angle_est.mean_angle_deg is None:
+            lines.append((
+                f"Angle: N/A  "
+                f"full_bits={angle_est.visible_bits}  "
+                f"sync={angle_est.matched_windows}/{angle_est.total_windows}",
+                COLOR_MUTED, 0.44, 1
+            ))
+        else:
+            std_str = (
+                f"{angle_est.std_angle_deg:.5f}°"
+                if angle_est.std_angle_deg is not None
+                else "N/A"
+            )
+            offset_str = (
+                f"  offset={angle_est.chosen_offset}"
+                if angle_est.chosen_offset is not None
+                else ""
+            )
+            lines.append((
+                f"Angle: {angle_est.mean_angle_deg:.4f}°  "
+                f"std={std_str}  "
+                f"full_bits={angle_est.visible_bits}  "
+                f"sync={angle_est.matched_windows}/{angle_est.total_windows}"
+                f"{offset_str}",
+                COLOR_TEXT, 0.44, 1
+            ))
+
         lines.append((
             f"Recov: {''.join(str(int(b)) for b in det.recovered_bit_values)}",
             COLOR_RECOV, 0.42, 1
@@ -257,11 +327,9 @@ def draw_bit_panel(
     lo: float, hi: float,
 ) -> np.ndarray:
     """
-    Нижняя панель: нормализованный сигнал + разметка восстановленных битов.
+    Нижняя панель: нормализованный сигнал + разметка только ПОЛНЫХ восстановленных битов.
 
-    Важное отличие от старой версии:
-    рисуются не только сегменты, а именно отдельные биты, включая частично
-    видимые крайние биты у ROI.
+    Частично видимые биты у границ ROI не рисуются.
     """
     canvas = np.full((height, width, 3), 255, dtype=np.uint8)
     xmap   = _x_mapper(n_pixels, width, left_pad=0)
@@ -271,8 +339,8 @@ def draw_bit_panel(
     plot_h   = height - top_pad - bot_pad
     sig_top  = top_pad + int(plot_h * 0.05)
     sig_bot  = top_pad + int(plot_h * 0.55)
-    bit_y_hi = top_pad + int(plot_h * 0.65)  # y для бит = 1
-    bit_y_lo = top_pad + int(plot_h * 0.90)  # y для бит = 0
+    bit_y_hi = top_pad + int(plot_h * 0.65)
+    bit_y_lo = top_pad + int(plot_h * 0.90)
 
     # --- Сигнал ---
     norm = np.clip((pixels - lo) / max(hi - lo, 1e-6), 0.0, 1.0)
@@ -304,39 +372,35 @@ def draw_bit_panel(
             cv2.LINE_AA,
         )
 
-    # --- Строим видимые биты из bit_segments ---
-    visible_cells = []
+    # --- Полные восстановленные биты ---
+    full_cells = []
     cell_boundaries = []
 
-    for seg_idx, seg in enumerate(det.bit_segments):
-        if seg.n_bits <= 0:
+    for rb in det.recovered_bits:
+        if rb.segment_idx < 0 or rb.segment_idx >= len(det.bit_segments):
             continue
+
+        seg = det.bit_segments[rb.segment_idx]
         if seg.measured_period <= 1e-12:
             continue
-        if seg.end_pos <= seg.start_pos:
-            continue
 
-        grid_start = (
-            seg.grid_start_pos
-            if getattr(seg, "grid_start_pos", None) is not None
-            else seg.start_pos
+        bit_start = float(rb.position)
+        bit_end = float(bit_start + seg.measured_period)
+
+        eps = max(1e-9, 1e-6 * seg.measured_period)
+        is_full_bit_inside = (
+            bit_start >= float(seg.start_pos) - eps and
+            bit_end <= float(seg.end_pos) + eps
         )
 
-        for i in range(seg.n_bits):
-            bit_start = grid_start + i * seg.measured_period
-            bit_end = bit_start + seg.measured_period
+        if not is_full_bit_inside:
+            continue
 
-            visible_start = max(bit_start, seg.start_pos)
-            visible_end = min(bit_end, seg.end_pos)
+        full_cells.append((bit_start, bit_end, int(rb.value)))
+        cell_boundaries.append(bit_start)
+        cell_boundaries.append(bit_end)
 
-            if visible_end - visible_start <= 1e-12:
-                continue
-
-            visible_cells.append((visible_start, visible_end, seg.bit_value, seg_idx))
-            cell_boundaries.append(visible_start)
-            cell_boundaries.append(visible_end)
-
-    # --- Границы видимых битовых ячеек ---
+    # --- Границы полных битовых ячеек ---
     if cell_boundaries:
         uniq = []
         for b in sorted(cell_boundaries):
@@ -354,15 +418,14 @@ def draw_bit_panel(
                 cv2.LINE_AA,
             )
 
-    # --- Видимые восстановленные биты ---
-    for cell_start, cell_end, bit_value, _seg_idx in visible_cells:
-        x1 = xmap(cell_start)
-        x2 = xmap(cell_end)
+    # --- Отрисовка только полных битов ---
+    for bit_start, bit_end, bit_value in full_cells:
+        x1 = xmap(bit_start)
+        x2 = xmap(bit_end)
         y_seg = bit_y_hi if bit_value else bit_y_lo
 
         cv2.line(canvas, (x1, y_seg), (x2, y_seg), COLOR_RECOV, 2, cv2.LINE_AA)
 
-        # Подпись бита, если ячейка достаточно широкая
         if abs(x2 - x1) >= 8:
             mid_x = (x1 + x2) // 2 - 4
             _put(
@@ -400,7 +463,7 @@ def draw_bit_panel(
         COLOR_EDGE,
         1,
     )
-    _put(canvas, "Signal + bit recovery", 4, top_pad + 12, COLOR_MUTED, 0.38)
+    _put(canvas, "Signal + full-bit recovery", 4, top_pad + 12, COLOR_MUTED, 0.38)
     return canvas
 
 
@@ -419,13 +482,12 @@ def _detect_with_fixed_roi(
     roi_right: int,
 ) -> "EdgeDetectionResult":
     """
-    Запускает детектор на ПОЛНОМ сигнале, но с фиксированным ROI в координатах
-    исходного сигнала.
+    Запускает детектор на ПОЛНОМ сигнале, но с фиксированным ROI
+    в координатах исходного сигнала.
 
     Это важно для текущей реализации blais_rioux:
-    крайние сегменты около ROI восстанавливаются внутри detect_edges_and_recover_bits(...)
-    только если roi_start/roi_end переданы явно. Физическая обрезка сигнала до ROI
-    ломает восстановление бит от края ROI до первого/последнего фронта.
+    крайние сегменты около ROI восстанавливаются корректно только если
+    roi_start/roi_end переданы явно.
     """
     from dataclasses import replace as _replace
 
@@ -443,8 +505,6 @@ def _detect_with_fixed_roi(
 
     signal = pixels.astype(np.float64)
 
-    # Передаём фиксированный ROI напрямую в детектор.
-    # Сигнал и истинные фронты остаются в полных координатах.
     br_config_roi = _replace(
         br_config,
         roi_start=roi_start,
@@ -461,6 +521,72 @@ def _detect_with_fixed_roi(
 
     return det
 
+
+# ============================================================
+# Расчет угла
+# ============================================================
+
+def _estimate_angle_if_possible(
+    det: Optional["EdgeDetectionResult"],
+    code_angle_map: Optional[dict[str, int]],
+    n_pixels: int,
+) -> Optional["AngleEstimationResult"]:
+    """
+    Считает абсолютный угол диска по полным битам внутри ROI.
+
+    Все параметры углового кода берутся из постоянных настроек в коде:
+    - FULL_DISK_CODE_SEQUENCE
+    - TOTAL_CODE_BITS_ON_DISK
+    - CODEWORD_LENGTH_BITS
+    - ANGLE_PERIOD_DEG
+    - SENSOR_CENTER_PIXEL
+    - ANGLE_PER_SENSOR_PIXEL_DEG / ANGLE_AXIS_SIGN
+    """
+    if not ENABLE_ANGLE_ESTIMATION:
+        return None
+
+    if det is None:
+        return None
+
+    if code_angle_map is None:
+        return None
+
+    if CODEWORD_LENGTH_BITS <= 0:
+        return None
+
+    if TOTAL_CODE_BITS_ON_DISK <= 0:
+        return None
+
+    sensor_center_px = (
+        float(SENSOR_CENTER_PIXEL)
+        if SENSOR_CENTER_PIXEL is not None
+        else 0.5 * (n_pixels - 1)
+    )
+
+    if ANGLE_PER_SENSOR_PIXEL_DEG is not None:
+        angle_per_px_deg = float(ANGLE_PER_SENSOR_PIXEL_DEG)
+    else:
+        bit_period_px = float(det.bit_width_px)
+
+        if bit_period_px <= 1e-12:
+            return None
+
+        angle_per_px_deg = (
+            float(ANGLE_AXIS_SIGN)
+            * float(ANGLE_PERIOD_DEG)
+            / (float(TOTAL_CODE_BITS_ON_DISK) * bit_period_px)
+        )
+
+    return estimate_disk_angle_from_result(
+        detection_result=det,
+        code_angle_map=code_angle_map,
+        codeword_length=CODEWORD_LENGTH_BITS,
+        total_code_bits=TOTAL_CODE_BITS_ON_DISK,
+        sensor_center_px=sensor_center_px,
+        angle_per_px_deg=angle_per_px_deg,
+        angle_period_deg=ANGLE_PERIOD_DEG,
+    )
+
 # ============================================================
 # Сборка кадра
 # ============================================================
@@ -470,6 +596,7 @@ def compose_frame(
     args,
     ranger: AutoRange,
     det: Optional[EdgeDetectionResult],
+    angle_est: Optional["AngleEstimationResult"],
     filter_order: int,
     threshold_pct: float,
 ) -> np.ndarray:
@@ -485,13 +612,24 @@ def compose_frame(
     bit_h    = max(80, args.window_height - header_h - strip_h)
 
     has_gt = (packet.source_label == "simulation")
-    hdr    = draw_header(packet, det, args.n_bits, lo, hi, width, header_h,
-                         filter_order, threshold_pct, has_ground_truth=has_gt,
-                         roi_left=args.roi_left, roi_right=args.roi_right)
+    hdr    = draw_header(
+        packet,
+        det,
+        angle_est,
+        args.n_bits,
+        lo,
+        hi,
+        width,
+        header_h,
+        filter_order,
+        threshold_pct,
+        has_ground_truth=has_gt,
+        roi_left=args.roi_left,
+        roi_right=args.roi_right,
+    )
     strip  = draw_strip_2d(pixels, lo, hi, width, strip_h, invert=args.invert)
     bp     = draw_bit_panel(pixels, det, width, bit_h, n_px, lo, hi)
 
-    # Рисуем границы фиксированного ROI поверх strip и bit_panel
     xmap = _x_mapper(n_px, width)
     for clip_px, panel in ((args.roi_left, strip), (args.roi_left, bp),
                             (n_px - 1 - args.roi_right, strip), (n_px - 1 - args.roi_right, bp)):
@@ -512,8 +650,6 @@ def compose_frame(
 
 def matrix_packets(args):
     """Генератор пакетов из serial CSV (формат: row_index,px0,px1,...,pxN-1)."""
-    if _serial_module is None:
-        raise RuntimeError("pyserial не установлен: pip install pyserial")
     ser = _serial_module.Serial(args.port, args.baud, timeout=1)
     time.sleep(1.0)
     try:
@@ -606,7 +742,7 @@ def build_argparser() -> argparse.ArgumentParser:
     disp.add_argument("--roi-left",      type=int,   default=0,   help="Обрезка сигнала слева, пикселей (default: 0)")
     disp.add_argument("--roi-right",     type=int,   default=0,   help="Обрезка сигнала справа, пикселей (default: 0)")
     disp.add_argument("--pixel-width",   type=int,   default=5,   help="Ширина одного пикселя ПЗС на экране (default: 5)")
-    disp.add_argument("--header-height", type=int,   default=88,  help="Высота заголовка, px (default: 88)")
+    disp.add_argument("--header-height", type=int, default=110,   help="Высота заголовка, px (default: 110)")
     disp.add_argument("--strip-height",  type=int,   default=40,  help="Высота 2D-полосы, px (default: 40)")
     disp.add_argument("--window-height", type=int,   default=500, help="Общая высота окна (default: 500)")
     disp.add_argument("--invert",        action="store_true",     help="Инвертировать grayscale")
@@ -632,6 +768,31 @@ def run(args) -> None:
         minmax_window_px=args.minmax_window,
     )
 
+    angle_code_map: Optional[dict[str, int]] = None
+
+    if ENABLE_ANGLE_ESTIMATION:
+        try:
+            if not FULL_DISK_CODE_SEQUENCE:
+                raise ValueError("FULL_DISK_CODE_SEQUENCE is empty")
+
+            angle_code_map = build_code_angle_map(
+                code_sequence=FULL_DISK_CODE_SEQUENCE,
+                total_code_bits=TOTAL_CODE_BITS_ON_DISK,
+                codeword_length=CODEWORD_LENGTH_BITS,
+            )
+
+            print(
+                "[INFO] Кодовая карта построена: "
+                f"N={TOTAL_CODE_BITS_ON_DISK}, "
+                f"m={CODEWORD_LENGTH_BITS}, "
+                f"words={len(angle_code_map)}"
+            )
+
+        except Exception as e:
+            print(f"[ERROR] Невозможно построить кодовую карту: {e}",
+                  file=sys.stderr)
+            sys.exit(1)
+
     ranger = AutoRange()
     win    = "Blais-Rioux Edge Detector"
 
@@ -642,11 +803,13 @@ def run(args) -> None:
             sys.exit(1)
         if not args.no_window:
             cv2.namedWindow(win, cv2.WINDOW_NORMAL)
+
         for packet in matrix_packets(args):
             pixels = packet.pixels
-            # ground truth неизвестен при работе с матрицей → фиктивные данные
             true_bits  = np.zeros(args.n_bits, dtype=np.int32)
             true_edges = np.array([])
+
+            angle_est = None
             try:
                 det = _detect_with_fixed_roi(
                     pixels,
@@ -656,21 +819,37 @@ def run(args) -> None:
                     roi_left=args.roi_left,
                     roi_right=args.roi_right,
                 )
+                angle_est = _estimate_angle_if_possible(
+                    det,
+                    angle_code_map,
+                    len(pixels),
+                )
             except Exception as e:
                 print(f"[WARN] Ошибка обработки: {e}")
                 det = None
+                angle_est = None
 
-            frame = compose_frame(packet, args, ranger, det,
-                                  args.filter_order, args.threshold)
+            frame = compose_frame(
+                packet,
+                args,
+                ranger,
+                det,
+                angle_est,
+                args.filter_order,
+                args.threshold,
+            )
+
             if args.save:
                 cv2.imwrite(args.save, frame)
                 print(f"Сохранено: {args.save}")
                 break
+
             if not args.no_window:
                 cv2.imshow(win, frame)
                 key = cv2.waitKey(1) & 0xFF
                 if key in (ord("q"), 27):
                     break
+
         if not args.no_window:
             cv2.destroyAllWindows()
         return
@@ -694,12 +873,14 @@ def run(args) -> None:
             seed=seed,
         )
         sim_result = simulate_ccd(sim_cfg)
+
         packet = FramePacket(
             row_index=seed if args.animate else 0,
             pixels=sim_result.adc_signal.astype(np.float32),
             source_label="simulation",
         )
 
+        angle_est = None
         try:
             det = _detect_with_fixed_roi(
                 sim_result.adc_signal.astype(np.float64),
@@ -710,12 +891,25 @@ def run(args) -> None:
                 roi_left=args.roi_left,
                 roi_right=args.roi_right,
             )
+            angle_est = _estimate_angle_if_possible(
+                det,
+                angle_code_map,
+                len(sim_result.adc_signal),
+            )
         except Exception as e:
             print(f"[WARN] Ошибка детектора: {e}")
             det = None
+            angle_est = None
 
-        frame = compose_frame(packet, args, ranger, det,
-                              args.filter_order, args.threshold)
+        frame = compose_frame(
+            packet,
+            args,
+            ranger,
+            det,
+            angle_est,
+            args.filter_order,
+            args.threshold,
+        )
 
         if args.save:
             cv2.imwrite(args.save, frame)
@@ -738,7 +932,6 @@ def run(args) -> None:
         if args.animate:
             seed += 1
         else:
-            # Статичный кадр — ждём нажатия
             pass
 
     if not args.no_window:
