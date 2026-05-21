@@ -23,7 +23,7 @@ from typing import Dict, List, Optional, TYPE_CHECKING
 import numpy as np
 
 if TYPE_CHECKING:
-    from src.blais_rioux import EdgeDetectionResult
+    from src.blais_rioux import BitRecoveryResult
 
 
 @dataclass
@@ -227,7 +227,7 @@ def build_code_angle_map(
 
 
 def estimate_disk_angle_from_result(
-    detection_result: "EdgeDetectionResult",
+    detection_result: "BitRecoveryResult",
     code_angle_map: Dict[str, int],
     codeword_length: int,
     total_code_bits: int,

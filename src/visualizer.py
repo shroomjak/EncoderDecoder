@@ -19,7 +19,7 @@ from typing import Tuple, Optional
 
 from src.ccd_simulator import SimulatorConfig, SimulationResult, simulate_ccd
 from src.blais_rioux import (
-    BRConfig, EdgeDetectionResult, DetectedEdge,
+    BRConfig, EdgeDetectionResult, BitRecoveryResult,
     detect_edges_and_recover_bits,
 )
 
@@ -82,7 +82,7 @@ def _add_edge_markers(
 # Основная функция визуализации
 def visualize_result(
     sim_result: SimulationResult,
-    detection_result: EdgeDetectionResult,
+    detection_result: BitRecoveryResult,
     window_name: str = "Цифровая модель",
 ) -> plt.Figure:
     """
@@ -311,7 +311,7 @@ def visualize_result(
 
 def print_detailed_results(
     sim_result: SimulationResult,
-    detection_result: EdgeDetectionResult,
+    detection_result: BitRecoveryResult,
 ) -> None:
     """Вывод подробных результатов в консоль."""
     det = detection_result
@@ -379,7 +379,7 @@ def run_visualization(
     br_config: BRConfig,
     show_window: bool = True,
     save_path: Optional[str] = None,
-) -> Tuple[plt.Figure, SimulationResult, EdgeDetectionResult]:
+) -> Tuple[plt.Figure, SimulationResult, BitRecoveryResult]:
     """
     Запускает полный пайплайн: симуляция → обработка → визуализация.
 

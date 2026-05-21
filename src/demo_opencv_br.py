@@ -32,7 +32,11 @@ import numpy as np
 # Скрипт предполагается запускать из корня репозитория EncoderDecoder.
 # ---------------------------------------------------------------------------
 from src.ccd_simulator import SimulatorConfig, simulate_ccd
-from src.blais_rioux import BRConfig, detect_edges_and_recover_bits, EdgeDetectionResult
+from src.blais_rioux import (
+    BRConfig,
+    detect_edges_and_recover_bits,
+    EdgeDetectionResult, BitRecoveryResult, apply_minmax_normalization,
+)
 from src.disk_angle_estimator import (
     AngleEstimationResult,
     build_code_angle_map,
@@ -190,7 +194,7 @@ def normalize_pixels(pixels: np.ndarray, lo: float, hi: float,
 
 def draw_header(
     packet: FramePacket,
-    det: Optional[EdgeDetectionResult],
+    det: Optional[BitRecoveryResult],
     angle_est: Optional["AngleEstimationResult"],
     n_bits_apriori: int,
     lo: float, hi: float,
@@ -321,10 +325,11 @@ def draw_strip_2d(pixels: np.ndarray, lo: float, hi: float,
 
 def draw_bit_panel(
     pixels: np.ndarray,
-    det: Optional[EdgeDetectionResult],
+    det: Optional[BitRecoveryResult],
     width: int, height: int,
     n_pixels: int,
     lo: float, hi: float,
+    minmax_window: int
 ) -> np.ndarray:
     """
     Нижняя панель: нормализованный сигнал + разметка только ПОЛНЫХ восстановленных битов.
@@ -353,6 +358,20 @@ def draw_bit_panel(
         [np.array(pts, dtype=np.int32)],
         False,
         (80, 80, 80),
+        1,
+        cv2.LINE_AA,
+    )
+
+    local_norm = apply_minmax_normalization(norm, minmax_window)
+    pts = []
+    for i, v in enumerate(local_norm):
+        y = int(round(sig_bot - v * (sig_bot - sig_top)))
+        pts.append((xmap(i), y))
+    cv2.polylines(
+        canvas,
+        [np.array(pts, dtype=np.int32)],
+        False,
+        (150, 20, 20),
         1,
         cv2.LINE_AA,
     )
@@ -480,7 +499,7 @@ def _detect_with_fixed_roi(
     br_config: "BRConfig",
     roi_left: int,
     roi_right: int,
-) -> "EdgeDetectionResult":
+) -> "BitRecoveryResult":
     """
     Запускает детектор на ПОЛНОМ сигнале, но с фиксированным ROI
     в координатах исходного сигнала.
@@ -628,7 +647,7 @@ def compose_frame(
         roi_right=args.roi_right,
     )
     strip  = draw_strip_2d(pixels, lo, hi, width, strip_h, invert=args.invert)
-    bp     = draw_bit_panel(pixels, det, width, bit_h, n_px, lo, hi)
+    bp     = draw_bit_panel(pixels, det, width, bit_h, n_px, lo, hi, args.minmax_window)
 
     xmap = _x_mapper(n_px, width)
     for clip_px, panel in ((args.roi_left, strip), (args.roi_left, bp),
