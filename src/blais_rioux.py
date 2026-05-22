@@ -473,13 +473,17 @@ def detect_edges(
     x_u, undist = _undistort_and_resample(
         raw, config.distort_coeff, config.undist_output_step_px
     )
+
+    _, undist_vignette = _undistort_and_resample(
+        VIGNETTE, config.distort_coeff, config.undist_output_step_px
+    )
+    print(undist_vignette)
     m = len(undist)
 
     # Steps 1-3
     sig_norm   = normalize_global(undist)
     sig_smooth = gaussian_filter1d(sig_norm, sigma=config.smoothing_sigma)
-    vignette_norm = normalize_global(sig_smooth / VIGNETTE)
-
+    vignette_norm = normalize_global(sig_smooth / undist_vignette)
     # Steps 4-5
     kernel = make_br_kernel(config.filter_order)
     d1     = correlate_mirror(vignette_norm, kernel)

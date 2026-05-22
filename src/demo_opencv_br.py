@@ -45,7 +45,7 @@ from src.distortion.math1d import restore_signal_1d
 
 SENSOR_CENTER_PIXEL = None
 ANGLE_PER_SENSOR_PIXEL_DEG = None
-ANGLE_AXIS_SIGN = -1.0
+ANGLE_AXIS_SIGN = 1.0
 ENABLE_ANGLE_ESTIMATION = True
 DISTORT_K: float = 0.05
 
