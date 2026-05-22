@@ -143,9 +143,6 @@ class BRConfig:
     smoothing_sigma: float = 0.2
     """Gaussian smoothing sigma before differentiation."""
 
-    minmax_window_px: int = 10
-    """Sliding window width for local min-max normalisation."""
-
     distort_coeff: float = 0.0
     """Division-model coefficient k. 0 = no correction.
     When non-zero, the signal is geometry-corrected (N->M, bicubic spline)
@@ -477,7 +474,6 @@ def detect_edges(
     _, undist_vignette = _undistort_and_resample(
         VIGNETTE, config.distort_coeff, config.undist_output_step_px
     )
-    print(undist_vignette)
     m = len(undist)
 
     # Steps 1-3

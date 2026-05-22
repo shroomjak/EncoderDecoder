@@ -6,52 +6,30 @@ disk_angle_estimator.py — расчёт абсолютного угла дис�
 ------------------------------------------
 Входные данные: BitRecoveryResult det, code_angle_map, параметры диска.
 
-Шаг 1. Масштаб пиксель/угол — вычисляется из самого det:
-    mean_period_px = среднее measured_period по всем BitSegment
-    angle_per_px   = (360 / total_code_bits) / mean_period_px   [°/px]
+Шаг 1. Масштаб пиксель/угол вычисляется из самого det:
+    mean_period_px = среднее measured_period по всем BitSegment с весом n_bits
+    delta_phi      = angle_period_deg / total_code_bits
+    angle_per_px   = delta_phi / mean_period_px   [°/px]
 
-    Масштаб не передаётся снаружи: он всегда актуален и не зависит
-    от внешней калибровки.
+Шаг 2. Из det.recovered_bits извлекаются валидные биты в порядке возрастания
+position. Для каждого бита i:
+    x_i = position_i + 0.5 * measured_period_i   (центр бита в пикселях)
+    w_i = measured_period_i                      (вес = ширина бита)
 
-Шаг 2. Извлечение валидных бит из det.recovered_bits в порядке возрастания
-    position. Для каждого бита i вычисляется:
-        x_i  = position_i + 0.5 * measured_period_i   (центр бита в пикселях)
-        w_i  = measured_period_i                       (вес = ширина бита)
+Шаг 3. По всем скользящим окнам длины m = codeword_length:
+    - собирается наблюдаемое кодовое слово;
+    - ищется в code_angle_map (при reverse_direction карта перестроена
+      с реверсированной последовательностью);
+    - по битам окна считается взвешенный центр окна на сенсоре;
+    - получается оценка абсолютного угла диска:
+          theta = phi_win_center - signed_angle_per_px * (x_win_center - sensor_center_px)
 
-Шаг 3. Скользящие окна длины codeword_length.
-    Для каждого окна s = 0..n_bits-codeword_length:
-
-        codeword = bit_values[s : s+m]
-
-        Ищем codeword в code_angle_map → phi_win_deg (угол НАЧАЛА окна на диске).
-
-        Центр кодового окна в пикселях (взвешенный):
-            x_win_center_px = sum(w_i * x_i для i in [s, s+m)) / sum(w_i для i in [s, s+m))
-
-        Угол центра окна на диске (без wrap — линейная интерполяция):
-            phi_win_center_deg = start_bit_index * delta_phi + (m/2) * delta_phi
-                               = (start_bit_index + m/2) * delta_phi
-
-        Оценка угла диска:
-            theta = phi_win_center_deg - angle_per_px * (x_win_center_px - sensor_center_px)
-
-        Физический смысл: «кодовое окно с центром phi_win_center_deg° на диске
-        проецируется на пиксель x_win_center_px сенсора; сенсор смотрит на
-        угол sensor_center_deg = phi_win_center_deg − масштаб*(смещение от центра)».
+    signed_angle_per_px = +angle_per_px  при reverse_direction=False
+    signed_angle_per_px = -angle_per_px  при reverse_direction=True
 
 Шаг 4. Финал:
     mean_angle_deg = circular_mean(theta_s)
     std_angle_deg  = circular_std(theta_s)
-
-Замечания по робастности
-------------------------
-- angle_per_px вычисляется из det → адаптивен к реальному положению диска
-  и не требует внешней калибровки.
-- Каждое окно даёт независимую оценку по своему собственному x_win_center_px —
-  нет общего x_vis, нет offset_bits — ошибки не накапливаются от окна к окну.
-- phi_win_center_deg вычисляется линейно (без wrap до финального шага),
-  поэтому wraparound вблизи 0°/360° не вносит систематический сдвиг.
-- circular_mean / circular_std корректно обрабатывают переход через 0°.
 """
 
 from __future__ import annotations
@@ -83,33 +61,14 @@ ANGLE_PERIOD_DEG = 360.0
 # Структуры данных
 # ---------------------------------------------------------------------------
 
-@dataclass(frozen=True)
-class CodeAngleEntry:
-    """
-    Угловая информация о кодовом слове.
-
-    angle_lo_deg    — угол первого бита окна (start_bit_index * delta_phi)
-    angle_center_deg — угол центра окна ((start_bit_index + m/2) * delta_phi)
-    angle_hi_deg    — угол последнего бита окна ((start_bit_index + m) * delta_phi)
-
-    Все три значения хранятся в линейном виде [0, 360) без дополнительных wrap,
-    чтобы избежать разрывов при вычислениях вблизи 0°/360°.
-    """
-    codeword: str
-    start_bit_index: int
-    angle_lo_deg: float
-    angle_center_deg: float
-    angle_hi_deg: float
-
-
 @dataclass
 class AngleWindowSample:
     """Оценка угла по одному совпавшему кодовому окну."""
-    window_start: int           # индекс начала окна в visible bits
+    window_start: int
     codeword: str
-    window_center_px: float     # центр окна на сенсоре (пиксели)
-    window_angle_deg: float     # угол центра окна на диске
-    estimated_angle_deg: float  # оценка абсолютного угла диска
+    window_center_px: float
+    window_angle_deg: float
+    estimated_angle_deg: float
     start_bit_index: int = 0
 
 
@@ -121,8 +80,9 @@ class AngleEstimationResult:
     total_windows: int
     matched_windows: int
 
-    angle_per_px_deg: Optional[float] = None   # масштаб, вычисленный из det
-    mean_bit_period_px: Optional[float] = None  # средний период бита в пикселях
+    mean_bit_period_px: Optional[float] = None
+    angle_per_px_deg: Optional[float] = None
+    reverse_direction: bool = False
 
     samples: List[AngleWindowSample] = field(default_factory=list)
     mean_angle_deg: Optional[float] = None
@@ -146,13 +106,10 @@ def angle_in_range_deg(
     hi_deg: float,
     angle_period_deg: float = 360.0,
 ) -> bool:
-    """
-    Проверяет, попадает ли угол в полуинтервал [lo_deg, hi_deg) на окружности.
-    Поддерживает диапазоны с переходом через 0°.
-    """
-    a  = wrap_angle_deg(angle_deg,  angle_period_deg)
-    lo = wrap_angle_deg(lo_deg,     angle_period_deg)
-    hi = wrap_angle_deg(hi_deg,     angle_period_deg)
+    """Попадает ли угол в [lo_deg, hi_deg) на окружности."""
+    a = wrap_angle_deg(angle_deg, angle_period_deg)
+    lo = wrap_angle_deg(lo_deg, angle_period_deg)
+    hi = wrap_angle_deg(hi_deg, angle_period_deg)
     if lo <= hi:
         return lo <= a < hi
     return a >= lo or a < hi
@@ -163,7 +120,7 @@ def circular_mean_deg(
     weights: Optional[np.ndarray] = None,
     angle_period_deg: float = 360.0,
 ) -> Optional[float]:
-    """Circular mean (Mardia & Jupp) для углов в градусах."""
+    """Circular mean для углов в градусах."""
     if angles_deg is None or len(angles_deg) == 0:
         return None
     angles_deg = np.asarray(angles_deg, dtype=np.float64)
@@ -192,7 +149,7 @@ def circular_std_deg(
     weights: Optional[np.ndarray] = None,
     angle_period_deg: float = 360.0,
 ) -> Optional[float]:
-    """Circular std (Mardia & Jupp) для углов в градусах."""
+    """Circular std для углов в градусах."""
     if angles_deg is None or len(angles_deg) == 0:
         return None
     angles_deg = np.asarray(angles_deg, dtype=np.float64)
@@ -215,7 +172,7 @@ def circular_std_deg(
 
 
 # ---------------------------------------------------------------------------
-# Вспомогательные функции — кодовая карта
+# Кодовая карта
 # ---------------------------------------------------------------------------
 
 def _validate_binary_code_sequence(code_sequence: str, total_code_bits: int) -> str:
@@ -237,15 +194,13 @@ def build_code_angle_map(
     code_sequence: str,
     total_code_bits: int,
     codeword_length: int,
-    *,
     angle_period_deg: float = 360.0,
-) -> Dict[str, CodeAngleEntry]:
+) -> Dict[str, dict]:
     """
-    Строит карту codeword -> CodeAngleEntry.
+    Строит карту codeword -> {start_bit_index, angle_lo_deg, angle_center_deg, angle_hi_deg}.
 
-    angle_center_deg хранится как ЛИНЕЙНЫЙ угол (без wrap_angle_deg),
-    чтобы вычисление вблизи 0°/360° не вносило артефактов.
-    Wrap применяется только в финале estimate_disk_angle_from_result.
+    Углы хранятся в линейном виде (без wrap), чтобы арифметика
+    вблизи 0°/360° не вносила разрывов.
     """
     seq = _validate_binary_code_sequence(code_sequence, total_code_bits)
     if codeword_length <= 0:
@@ -258,8 +213,7 @@ def build_code_angle_map(
         raise ValueError("angle_period_deg must be > 0")
 
     delta = angle_period_deg / total_code_bits
-
-    code_map: Dict[str, CodeAngleEntry] = {}
+    code_map: Dict[str, dict] = {}
     duplicates: Dict[str, List[int]] = {}
 
     for start_idx in range(total_code_bits):
@@ -267,22 +221,15 @@ def build_code_angle_map(
             seq[(start_idx + k) % total_code_bits]
             for k in range(codeword_length)
         )
-        # Линейные углы (без wrap) — чтобы избежать разрывов в арифметике
-        angle_lo     = start_idx * delta
-        angle_center = (start_idx + codeword_length / 2.0) * delta
-        angle_hi     = (start_idx + codeword_length) * delta
-
-        entry = CodeAngleEntry(
-            codeword=codeword,
-            start_bit_index=start_idx,
-            angle_lo_deg=angle_lo,
-            angle_center_deg=angle_center,
-            angle_hi_deg=angle_hi,
-        )
-
+        entry = {
+            "start_bit_index": start_idx,
+            "angle_lo_deg": start_idx * delta,
+            "angle_center_deg": (start_idx + codeword_length / 2.0) * delta,
+            "angle_hi_deg": (start_idx + codeword_length) * delta,
+        }
         if codeword in code_map:
             duplicates.setdefault(
-                codeword, [code_map[codeword].start_bit_index]
+                codeword, [code_map[codeword]["start_bit_index"]]
             ).append(start_idx)
         else:
             code_map[codeword] = entry
@@ -296,27 +243,17 @@ def build_code_angle_map(
         raise ValueError(
             f"Кодовая карта неоднозначна — дублирующиеся слова: {details}"
         )
-
     return code_map
 
 
-def lookup_angle_by_code(
-    codeword: str,
-    code_angle_map: Dict[str, CodeAngleEntry],
-) -> Optional[CodeAngleEntry]:
-    """Возвращает угловую запись для кодового слова."""
-    return code_angle_map.get(codeword)
-
-
 def print_code_angle_table(
-    code_angle_map: Dict[str, CodeAngleEntry],
-    *,
+    code_angle_map: Dict[str, dict],
     filter_angle_lo: Optional[float] = None,
     filter_angle_hi: Optional[float] = None,
     angle_period_deg: float = 360.0,
     show_start_bit_index: bool = False,
 ) -> None:
-    """Печатает таблицу кодовой карты, сортировка по angle_center_deg."""
+    """Печатает таблицу кодовой карты, сортировка по углу центра."""
     if not code_angle_map:
         print("(code_angle_map is empty)")
         return
@@ -333,69 +270,119 @@ def print_code_angle_table(
             f"  {'Угол_нижн, °':>13} | {'Угол_центр, °':>14} | {'Угол_верхн, °':>14} | "
             f"{'Код':>{w}}"
         )
-
     sep = "-" * len(header)
     print(sep)
     print(header)
     print(sep)
 
-    entries = sorted(
-        code_angle_map.values(),
-        key=lambda e: e.angle_center_deg % angle_period_deg,
+    sorted_items = sorted(
+        code_angle_map.items(),
+        key=lambda kv: kv[1]["angle_center_deg"] % angle_period_deg,
     )
 
-    for entry in entries:
-        center_wrapped = entry.angle_center_deg % angle_period_deg
-        lo_wrapped     = entry.angle_lo_deg     % angle_period_deg
-        hi_wrapped     = entry.angle_hi_deg     % angle_period_deg
+    for codeword, entry in sorted_items:
+        lo_w = wrap_angle_deg(entry["angle_lo_deg"], angle_period_deg)
+        c_w = wrap_angle_deg(entry["angle_center_deg"], angle_period_deg)
+        hi_w = wrap_angle_deg(entry["angle_hi_deg"], angle_period_deg)
 
         if filter_angle_lo is not None and filter_angle_hi is not None:
-            if not angle_in_range_deg(
-                center_wrapped,
-                filter_angle_lo,
-                filter_angle_hi,
-                angle_period_deg=angle_period_deg,
-            ):
+            if not angle_in_range_deg(c_w, filter_angle_lo, filter_angle_hi, angle_period_deg):
                 continue
 
         if show_start_bit_index:
             print(
-                f"  {lo_wrapped:>13.4f} | "
-                f"{center_wrapped:>14.4f} | "
-                f"{hi_wrapped:>14.4f} | "
-                f"{entry.start_bit_index:>8d} | "
-                f"{entry.codeword:>{w}}"
+                f"  {lo_w:>13.4f} | {c_w:>14.4f} | {hi_w:>14.4f} | "
+                f"{entry['start_bit_index']:>8d} | {codeword:>{w}}"
             )
         else:
             print(
-                f"  {lo_wrapped:>13.4f} | "
-                f"{center_wrapped:>14.4f} | "
-                f"{hi_wrapped:>14.4f} | "
-                f"{entry.codeword:>{w}}"
+                f"  {lo_w:>13.4f} | {c_w:>14.4f} | {hi_w:>14.4f} | {codeword:>{w}}"
             )
-
     print(sep)
 
 
 # ---------------------------------------------------------------------------
-# Вспомогательные функции — извлечение бит и масштаб
+# Основная функция оценки угла
 # ---------------------------------------------------------------------------
 
-def _extract_valid_recovered_bits(
+def estimate_disk_angle_from_result(
     detection_result: "BitRecoveryResult",
-) -> tuple[List[int], List[float], List[float]]:
+    code_sequence: str,
+    total_code_bits: int,
+    codeword_length: int,
+    sensor_center_px: float,
+    angle_period_deg: float = 360.0,
+    reverse_direction: bool = False,
+) -> AngleEstimationResult:
     """
-    Извлекает валидные биты из det.recovered_bits в порядке возрастания position.
+    Оценка абсолютного угла диска по видимому участку кода.
 
-    Returns
-    -------
-    bit_values     : List[int]   — значения бит
-    bit_centers_px : List[float] — центры бит в пикселях (position + 0.5 * period)
-    bit_widths_px  : List[float] — ширины бит в пикселях (measured_period)
+    При reverse_direction=True карта перестраивается с реверсированной
+    кодовой последовательностью. Знак angle_per_px меняется.
+
+    Parameters
+    ----------
+    detection_result : BitRecoveryResult
+    code_sequence : str
+        Полная кодовая последовательность на диске.
+    total_code_bits : int
+        Число бит на полном диске N.
+    codeword_length : int
+        Длина кодового слова m.
+    sensor_center_px : float
+        Опорный центр сенсора в пикселях.
+    angle_period_deg : float
+        Полный угловой период.
+    reverse_direction : bool
+        Если True, последовательность реверсируется при построении карты,
+        знак масштаба меняется.
     """
-    bit_values:     List[int]   = []
+    if codeword_length <= 0:
+        raise ValueError("codeword_length must be > 0")
+    if total_code_bits <= 0:
+        raise ValueError("total_code_bits must be > 0")
+    if angle_period_deg <= 0:
+        raise ValueError("angle_period_deg must be > 0")
+
+    # --- Шаг 1. Масштаб из det ---
+    total_px = 0.0
+    total_n = 0
+    for seg in detection_result.bit_segments:
+        n = int(seg.n_bits)
+        p = float(seg.measured_period)
+        if n <= 0 or p <= 1e-12:
+            continue
+        total_px += p * n
+        total_n += n
+
+    mean_period_px = (total_px / total_n) if total_n > 0 else None
+
+    result = AngleEstimationResult(
+        codeword_length=codeword_length,
+        visible_bits=0,
+        total_windows=0,
+        matched_windows=0,
+        mean_bit_period_px=mean_period_px,
+        reverse_direction=reverse_direction,
+    )
+
+    if mean_period_px is None or mean_period_px <= 1e-12:
+        return result
+
+    delta_phi = angle_period_deg / total_code_bits
+    angle_per_px_abs = delta_phi / mean_period_px
+    result.angle_per_px_deg = angle_per_px_abs
+
+    # --- Построение карты (реверс последовательности при необходимости) ---
+    effective_sequence = code_sequence[::-1] if reverse_direction else code_sequence
+    code_map = build_code_angle_map(
+        effective_sequence, total_code_bits, codeword_length, angle_period_deg
+    )
+
+    # --- Шаг 2. Извлечение валидных бит ---
+    bit_values: List[int] = []
     bit_centers_px: List[float] = []
-    bit_widths_px:  List[float] = []
+    bit_widths_px: List[float] = []
 
     for rb in sorted(detection_result.recovered_bits, key=lambda b: b.position):
         if not (0 <= rb.segment_idx < len(detection_result.bit_segments)):
@@ -405,7 +392,7 @@ def _extract_valid_recovered_bits(
         if period_px <= 1e-12:
             continue
         bit_start = float(rb.position)
-        bit_end   = bit_start + period_px
+        bit_end = bit_start + period_px
         eps = max(1e-9, 1e-6 * period_px)
         if bit_start < float(seg.start_pos) - eps:
             continue
@@ -415,151 +402,38 @@ def _extract_valid_recovered_bits(
         bit_centers_px.append(bit_start + 0.5 * period_px)
         bit_widths_px.append(period_px)
 
-    return bit_values, bit_centers_px, bit_widths_px
-
-
-def _compute_mean_bit_period(detection_result: "BitRecoveryResult") -> Optional[float]:
-    """
-    Вычисляет средний период бита (пикселей) как взвешенное среднее
-    по всем BitSegment из det.
-
-        mean_period = sum(seg.measured_period * seg.n_bits) / sum(seg.n_bits)
-
-    Returns None, если сегментов нет или суммарное количество бит == 0.
-    """
-    total_px = 0.0
-    total_n  = 0
-    for seg in detection_result.bit_segments:
-        n = int(seg.n_bits)
-        if n <= 0 or seg.measured_period <= 1e-12:
-            continue
-        total_px += seg.measured_period * n
-        total_n  += n
-    if total_n == 0:
-        return None
-    return total_px / total_n
-
-
-# ---------------------------------------------------------------------------
-# Основная функция оценки угла
-# ---------------------------------------------------------------------------
-
-def estimate_disk_angle_from_result(
-    detection_result: "BitRecoveryResult",
-    code_angle_map: Dict[str, CodeAngleEntry],
-    codeword_length: int,
-    total_code_bits: int,
-    sensor_center_px: float,
-    angle_period_deg: float = 360.0,
-) -> AngleEstimationResult:
-    """
-    Оценка абсолютного угла диска по видимому участку кода.
-
-    Алгоритм описан в docstring модуля. Сигнатура намеренно НЕ принимает
-    angle_per_px_deg снаружи — масштаб вычисляется из det автоматически.
-
-    Parameters
-    ----------
-    detection_result : BitRecoveryResult
-    code_angle_map   : Dict[str, CodeAngleEntry]
-        Карта, построенная build_code_angle_map (angle_center_deg — линейный).
-    codeword_length  : int
-        Длина кодового слова m.
-    total_code_bits  : int
-        Число бит на полном диске N.
-    sensor_center_px : float
-        Опорный центр сенсора в пикселях (обычно (N_pixels - 1) / 2).
-    angle_period_deg : float
-        Полный угловой период (360.0).
-
-    Returns
-    -------
-    AngleEstimationResult
-    """
-    if codeword_length <= 0:
-        raise ValueError("codeword_length must be > 0")
-    if total_code_bits <= 0:
-        raise ValueError("total_code_bits must be > 0")
-    if angle_period_deg <= 0:
-        raise ValueError("angle_period_deg must be > 0")
-    if code_angle_map:
-        sample_key = next(iter(code_angle_map.keys()))
-        if len(sample_key) != codeword_length:
-            raise ValueError(
-                f"codeword_length={codeword_length} does not match "
-                f"map word length={len(sample_key)}"
-            )
-
-    # ------------------------------------------------------------------
-    # Шаг 1. Масштаб пиксель/угол из det
-    # ------------------------------------------------------------------
-    mean_period_px = _compute_mean_bit_period(detection_result)
-
-    result = AngleEstimationResult(
-        codeword_length=codeword_length,
-        visible_bits=0,
-        total_windows=0,
-        matched_windows=0,
-        mean_bit_period_px=mean_period_px,
-    )
-
-    if mean_period_px is None or mean_period_px <= 1e-12:
-        return result
-
-    # Угловой шаг одного бита на диске [°/бит]
-    delta_phi = angle_period_deg / total_code_bits
-    # Масштаб [°/пиксель]
-    angle_per_px = delta_phi / mean_period_px
-    result.angle_per_px_deg = angle_per_px
-
-    # ------------------------------------------------------------------
-    # Шаг 2. Извлечь валидные биты
-    # ------------------------------------------------------------------
-    bit_values, bit_centers_px, bit_widths_px = _extract_valid_recovered_bits(
-        detection_result
-    )
     n_bits = len(bit_values)
     total_windows = max(0, n_bits - codeword_length + 1)
-
-    result.visible_bits   = n_bits
-    result.total_windows  = total_windows
+    result.visible_bits = n_bits
+    result.total_windows = total_windows
 
     if n_bits == 0 or total_windows == 0:
         return result
 
     centers = np.asarray(bit_centers_px, dtype=np.float64)
-    widths  = np.asarray(bit_widths_px,  dtype=np.float64)
+    widths = np.asarray(bit_widths_px, dtype=np.float64)
 
-    # ------------------------------------------------------------------
-    # Шаг 3. По каждому matched-window — независимая оценка угла
-    # ------------------------------------------------------------------
+    # --- Шаг 3. Скользящие окна ---
     samples: List[AngleWindowSample] = []
     angle_values_deg: List[float] = []
 
     for s in range(total_windows):
-        # Кодовое слово окна
         codeword = "".join(str(bit_values[s + k]) for k in range(codeword_length))
 
-        entry = code_angle_map.get(codeword)
+        entry = code_map.get(codeword)
         if entry is None:
             continue
 
-        # Центр окна на сенсоре (взвешенное среднее по битам окна)
-        w_win  = widths[s : s + codeword_length]
-        cx_win = centers[s : s + codeword_length]
-        wsum   = float(np.sum(w_win))
+        w_win = widths[s: s + codeword_length]
+        c_win = centers[s: s + codeword_length]
+        wsum = float(np.sum(w_win))
         if wsum <= 1e-12:
             continue
-        x_win_center = float(np.sum(w_win * cx_win) / wsum)
 
-        # Угол центра окна на диске (линейный, без wrap — избегаем разрывов)
-        phi_win_center = entry.angle_center_deg   # уже линейный из build_code_angle_map
+        x_win_center = float(np.sum(w_win * c_win) / wsum)
+        phi_win_center = entry["angle_center_deg"]
 
-        # Оценка угла диска: центр окна на диске минус смещение центра окна
-        # относительно центра сенсора, переведённое в градусы
-        theta = phi_win_center - angle_per_px * (x_win_center - sensor_center_px)
-
-        # Нормализуем в [0, 360) только в самом конце
+        theta = phi_win_center - angle_per_px_abs * (x_win_center - sensor_center_px)
         theta_wrapped = wrap_angle_deg(theta, angle_period_deg)
 
         angle_values_deg.append(theta_wrapped)
@@ -569,19 +443,21 @@ def estimate_disk_angle_from_result(
             window_center_px=x_win_center,
             window_angle_deg=wrap_angle_deg(phi_win_center, angle_period_deg),
             estimated_angle_deg=theta_wrapped,
-            start_bit_index=entry.start_bit_index,
+            start_bit_index=entry["start_bit_index"],
         ))
 
-    result.matched_windows = len(samples)
     result.samples = samples
+    result.matched_windows = len(samples)
 
     if not angle_values_deg:
         return result
 
+    # --- Шаг 4. Circular mean / std ---
     angles_arr = np.asarray(angle_values_deg, dtype=np.float64)
     result.mean_angle_deg = circular_mean_deg(angles_arr, angle_period_deg=angle_period_deg)
-    result.std_angle_deg  = circular_std_deg(angles_arr,  angle_period_deg=angle_period_deg)
+    result.std_angle_deg = circular_std_deg(angles_arr, angle_period_deg=angle_period_deg)
 
+    print("angles arr", angles_arr)
     return result
 
 
@@ -590,14 +466,10 @@ if __name__ == "__main__":
         FULL_DISK_CODE_SEQUENCE,
         TOTAL_CODE_BITS_ON_DISK,
         CODEWORD_LENGTH_BITS,
-        angle_period_deg=ANGLE_PERIOD_DEG,
+        ANGLE_PERIOD_DEG,
     )
 
     print("Фильтр по углу центра окна: 90°..95°")
     print_code_angle_table(
-        code_map,
-        filter_angle_lo=90.0,
-        filter_angle_hi=95.0,
-        angle_period_deg=ANGLE_PERIOD_DEG,
-        show_start_bit_index=True,
+        code_map, 90.0, 95.0, ANGLE_PERIOD_DEG, True
     )

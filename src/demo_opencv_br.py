@@ -45,7 +45,7 @@ from src.distortion.math1d import restore_signal_1d
 
 SENSOR_CENTER_PIXEL = None
 ANGLE_PER_SENSOR_PIXEL_DEG = None
-ANGLE_AXIS_SIGN = 1.0
+ANGLE_AXIS_SIGN = True
 ENABLE_ANGLE_ESTIMATION = True
 DISTORT_K: float = 0.05
 
@@ -294,28 +294,23 @@ def _detect_full_width(
 
 def _estimate_angle_if_possible(
     det: Optional[BitRecoveryResult],
-    code_angle_map: Optional[dict],
+    code_sequence: str,
     n_pixels: int,
 ) -> Optional[AngleEstimationResult]:
-    if not ENABLE_ANGLE_ESTIMATION or det is None or code_angle_map is None:
+    if not ENABLE_ANGLE_ESTIMATION or det is None:
         return None
     if CODEWORD_LENGTH_BITS <= 0 or TOTAL_CODE_BITS_ON_DISK <= 0:
         return None
     sc_px = float(SENSOR_CENTER_PIXEL) if SENSOR_CENTER_PIXEL is not None else 0.5 * (n_pixels - 1)
-    if ANGLE_PER_SENSOR_PIXEL_DEG is not None:
-        a_per_px = float(ANGLE_PER_SENSOR_PIXEL_DEG)
-    else:
-        if det.bit_width_px <= 1e-12:
-            return None
-        a_per_px = float(ANGLE_AXIS_SIGN) * float(ANGLE_PERIOD_DEG) / (float(TOTAL_CODE_BITS_ON_DISK) * det.bit_width_px)
+
     return estimate_disk_angle_from_result(
         detection_result=det,
-        code_angle_map=code_angle_map,
+        code_sequence=code_sequence,
         codeword_length=CODEWORD_LENGTH_BITS,
         total_code_bits=TOTAL_CODE_BITS_ON_DISK,
         sensor_center_px=sc_px,
-        angle_per_px_deg=a_per_px,
         angle_period_deg=ANGLE_PERIOD_DEG,
+        reverse_direction=ANGLE_AXIS_SIGN
     )
 
 
@@ -444,7 +439,6 @@ def build_argparser() -> argparse.ArgumentParser:
     br.add_argument("--threshold", type=float, default=15.0)
     br.add_argument("--min-dist", type=float, default=30.0)
     br.add_argument("--smoothing", type=float, default=0.2)
-    br.add_argument("--minmax-window", type=int, default=50)
 
     cor = p.add_argument_group("Distortion correction")
     cor.add_argument("--distort-k", type=float, default=None)
@@ -470,17 +464,8 @@ def run(args) -> None:
         min_edge_distance_factor=args.min_dist / 100.0,
         bit_width_px=args.bit_width,
         smoothing_sigma=args.smoothing,
-        minmax_window_px=args.minmax_window,
         distort_coeff=distort_k,
     )
-
-    angle_code_map: Optional[dict] = None
-    if ENABLE_ANGLE_ESTIMATION:
-        angle_code_map = build_code_angle_map(
-            code_sequence=FULL_DISK_CODE_SEQUENCE,
-            total_code_bits=TOTAL_CODE_BITS_ON_DISK,
-            codeword_length=CODEWORD_LENGTH_BITS,
-        )
 
     ranger = AutoRange()
     win = "Blais-Rioux Edge Detector"
@@ -500,7 +485,7 @@ def run(args) -> None:
                     np.array([]),
                     br_config,
                 )
-                angle_est = _estimate_angle_if_possible(det, angle_code_map, len(packet.pixels))
+                angle_est = _estimate_angle_if_possible(det, FULL_DISK_CODE_SEQUENCE, len(packet.pixels))
             except Exception as e:
                 print(f"[WARN] {e}")
             frame = compose_frame(packet, args, ranger, det, angle_est, args.filter_order, args.threshold, distort_k)
@@ -545,7 +530,7 @@ def run(args) -> None:
                 sim_result.true_edges,
                 br_config,
             )
-            angle_est = _estimate_angle_if_possible(det, angle_code_map, len(sim_result.adc_signal))
+            angle_est = _estimate_angle_if_possible(det, FULL_DISK_CODE_SEQUENCE, len(sim_result.adc_signal))
         except Exception as e:
             print(f"[WARN] Detector error: {e}")
 
