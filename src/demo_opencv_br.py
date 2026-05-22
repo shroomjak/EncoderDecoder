@@ -45,7 +45,6 @@ from src.distortion.math1d import restore_signal_1d
 
 SENSOR_CENTER_PIXEL = None
 ANGLE_PER_SENSOR_PIXEL_DEG = None
-ANGLE_AXIS_SIGN = True
 ENABLE_ANGLE_ESTIMATION = True
 DISTORT_K: float = 0.05
 
@@ -187,9 +186,9 @@ def draw_header(
                 COLOR_MUTED, 0.44, 1,
             ))
         else:
-            std_s = f"{angle_est.std_angle_deg:.5f}°" if angle_est.std_angle_deg is not None else "N/A"
+            std_s = f"{angle_est.std_angle_deg:.5f} deg" if angle_est.std_angle_deg is not None else "N/A"
             lines.append((
-                f"Angle: {angle_est.mean_angle_deg:.4f}° std={std_s} full_bits={angle_est.visible_bits} sync={angle_est.matched_windows}/{angle_est.total_windows}",
+                f"Angle: {angle_est.mean_angle_deg:.4f} deg, std={std_s}, full_bits={angle_est.visible_bits} sync={angle_est.matched_windows}/{angle_est.total_windows}",
                 COLOR_TEXT, 0.44, 1,
             ))
         lines.append((
@@ -310,7 +309,6 @@ def _estimate_angle_if_possible(
         total_code_bits=TOTAL_CODE_BITS_ON_DISK,
         sensor_center_px=sc_px,
         angle_period_deg=ANGLE_PERIOD_DEG,
-        reverse_direction=ANGLE_AXIS_SIGN
     )
 
 

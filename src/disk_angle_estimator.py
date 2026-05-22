@@ -43,6 +43,8 @@ if TYPE_CHECKING:
     from src.blais_rioux import BitRecoveryResult
 
 
+REVERSE_AXIS_SIGN = True
+
 FULL_DISK_CODE_SEQUENCE = (
     "100001011100001100100001101100001110100001111100010001100010010100"
     "010011100010100100010101100010110100010111100011001100011010100011"
@@ -312,7 +314,6 @@ def estimate_disk_angle_from_result(
     codeword_length: int,
     sensor_center_px: float,
     angle_period_deg: float = 360.0,
-    reverse_direction: bool = False,
 ) -> AngleEstimationResult:
     """
     Оценка абсолютного угла диска по видимому участку кода.
@@ -333,9 +334,6 @@ def estimate_disk_angle_from_result(
         Опорный центр сенсора в пикселях.
     angle_period_deg : float
         Полный угловой период.
-    reverse_direction : bool
-        Если True, последовательность реверсируется при построении карты,
-        знак масштаба меняется.
     """
     if codeword_length <= 0:
         raise ValueError("codeword_length must be > 0")
@@ -363,7 +361,7 @@ def estimate_disk_angle_from_result(
         total_windows=0,
         matched_windows=0,
         mean_bit_period_px=mean_period_px,
-        reverse_direction=reverse_direction,
+        reverse_direction=REVERSE_AXIS_SIGN,
     )
 
     if mean_period_px is None or mean_period_px <= 1e-12:
@@ -374,7 +372,7 @@ def estimate_disk_angle_from_result(
     result.angle_per_px_deg = angle_per_px_abs
 
     # --- Построение карты (реверс последовательности при необходимости) ---
-    effective_sequence = code_sequence[::-1] if reverse_direction else code_sequence
+    effective_sequence = code_sequence[::-1] if REVERSE_AXIS_SIGN else code_sequence
     code_map = build_code_angle_map(
         effective_sequence, total_code_bits, codeword_length, angle_period_deg
     )
