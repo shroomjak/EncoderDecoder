@@ -111,10 +111,11 @@ def _undistort_and_resample(
     # New uniform grid spanning the same range
     x_min, x_max = float(x_u_px[0]), float(x_u_px[-1])
     m = int(np.floor((x_max - x_min) / output_step_px)) + 1
-    x_u_new = x_min + np.arange(m, dtype=np.float64) * output_step_px
+    x_u_new = np.arange(m, dtype=np.float64) * output_step_px
 
     # Natural cubic spline interpolation
-    spline = CubicSpline(x_u_px, signal, bc_type="natural")
+    x_u_px_shifted = x_u_px - x_min  # нормируем к [0, x_max - x_min]
+    spline = CubicSpline(x_u_px_shifted, signal, bc_type="natural")
     undist = spline(x_u_new)
 
     return x_u_new, undist
