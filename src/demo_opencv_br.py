@@ -20,7 +20,7 @@ from __future__ import annotations
 import argparse
 import sys
 import time
-from dataclasses import dataclass, replace as _replace
+from dataclasses import dataclass
 from typing import Optional, Tuple
 
 import cv2
@@ -31,34 +31,23 @@ from src.ccd_simulator import SimulatorConfig, simulate_ccd
 from src.blais_rioux import (
     BRConfig,
     BitRecoveryResult,
-    apply_minmax_normalization,
     detect_edges,
     recover_bits,
 )
 from src.disk_angle_estimator import (
     AngleEstimationResult,
     build_code_angle_map,
-    estimate_disk_angle_from_result,
+    estimate_disk_angle_from_result, CODEWORD_LENGTH_BITS,
+    TOTAL_CODE_BITS_ON_DISK, ANGLE_PERIOD_DEG, FULL_DISK_CODE_SEQUENCE,
 )
 from src.distortion.math1d import restore_signal_1d
 
-FULL_DISK_CODE_SEQUENCE = (
-    "100001011100001100100001101100001110100001111100010001100010010100"
-    "010011100010100100010101100010110100010111100011001100011010100011"
-    "011100011100100011101100011110100011111100100100101100100110100100"
-    "111100101001100101010100101011100101101100101110100101111100110011"
-    "100110101100110110100110111100111010100111011100111101100111110100"
-    "111111101010101101010111101011011101011101101011111101101101111101"
-    "1101111011111111"
-)
-TOTAL_CODE_BITS_ON_DISK = len(FULL_DISK_CODE_SEQUENCE)
-CODEWORD_LENGTH_BITS = 9
-ANGLE_PERIOD_DEG = 360.0
+
 SENSOR_CENTER_PIXEL = None
 ANGLE_PER_SENSOR_PIXEL_DEG = None
 ANGLE_AXIS_SIGN = -1.0
 ENABLE_ANGLE_ESTIMATION = True
-DISTORT_K: float = 0.0
+DISTORT_K: float = 0.05
 
 
 @dataclass
@@ -199,9 +188,8 @@ def draw_header(
             ))
         else:
             std_s = f"{angle_est.std_angle_deg:.5f}°" if angle_est.std_angle_deg is not None else "N/A"
-            off_s = f" offset={angle_est.chosen_offset}" if angle_est.chosen_offset is not None else ""
             lines.append((
-                f"Angle: {angle_est.mean_angle_deg:.4f}° std={std_s} full_bits={angle_est.visible_bits} sync={angle_est.matched_windows}/{angle_est.total_windows}{off_s}",
+                f"Angle: {angle_est.mean_angle_deg:.4f}° std={std_s} full_bits={angle_est.visible_bits} sync={angle_est.matched_windows}/{angle_est.total_windows}",
                 COLOR_TEXT, 0.44, 1,
             ))
         lines.append((
@@ -225,7 +213,6 @@ def draw_bit_panel(
     n_pixels: int,
     lo: float,
     hi: float,
-    minmax_window: int,
 ) -> np.ndarray:
     canvas = np.full((height, width, 3), 255, dtype=np.uint8)
     xmap = _x_mapper(n_pixels, width)
@@ -241,10 +228,11 @@ def draw_bit_panel(
     if pts:
         cv2.polylines(canvas, [np.array(pts, np.int32)], False, (80, 80, 80), 1, cv2.LINE_AA)
 
-    local_norm = apply_minmax_normalization(norm, minmax_window)
-    pts2 = [(xmap(i), int(round(sig_bot - v * (sig_bot - sig_top)))) for i, v in enumerate(local_norm)]
-    if pts2:
-        cv2.polylines(canvas, [np.array(pts2, np.int32)], False, (150, 20, 20), 1, cv2.LINE_AA)
+    if det is not None:
+        vignette_norm = det.edge_result.vignette_norm
+        pts2 = [(xmap(i), int(round(sig_bot - v * (sig_bot - sig_top)))) for i, v in enumerate(vignette_norm)]
+        if pts2:
+            cv2.polylines(canvas, [np.array(pts2, np.int32)], False, (150, 20, 20), 1, cv2.LINE_AA)
 
     if det is None:
         cv2.rectangle(canvas, (0, top_pad), (width - 1, height - bot_pad), COLOR_EDGE, 1)
@@ -264,7 +252,6 @@ def draw_bit_panel(
         if bs >= seg.start_pos - eps and be <= seg.end_pos + eps:
             full_cells.append((bs, be, int(rb.value)))
             boundaries += [bs, be]
-
     if boundaries:
         uniq = []
         for b in sorted(boundaries):
@@ -401,7 +388,6 @@ def compose_frame(
         n_pixels=n_undist,
         lo=lo,
         hi=hi,
-        minmax_window=args.minmax_window,
     )
 
     div = np.full((2, width, 3), 180, dtype=np.uint8)

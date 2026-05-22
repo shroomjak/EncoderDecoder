@@ -10,6 +10,9 @@ parse_csv_signal_line, read_csv_signal_from_open_serial, read_csv_signal_from_po
 """
 from __future__ import annotations
 
+import time
+
+import serial
 import numpy as np
 
 # ---------------------------------------------------------------------------
@@ -162,6 +165,6 @@ def read_csv_signal_from_port(
     timeout: float = 1.0,
 ) -> tuple[int, np.ndarray]:
     """Open serial port, read one line, close."""
-    import serial
+    time.sleep(1.0)
     with serial.Serial(port, baudrate=baudrate, timeout=timeout) as ser:
         return read_csv_signal_from_open_serial(ser)

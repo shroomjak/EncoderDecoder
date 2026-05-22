@@ -30,6 +30,39 @@ import numpy as np
 from scipy.interpolate import CubicSpline
 from scipy.ndimage import gaussian_filter1d, maximum_filter1d, correlate1d
 
+
+VIGNETTE = np.array([
+        811.755980861244,878.569377990431,983.239234449761,1088.28229665072,
+        1196.40669856459,1291.25358851675,1383.07177033493,1477.44976076555,
+        1568.28229665072,1694.36363636364,1780.23444976077,1836.80861244019,
+        1933.66028708134,2032.55502392344,2117.20574162679,2211.68421052632,
+        2335.23444976077,2480.13397129187,2485.52153110048,2674.27751196172,
+        2699.29186602871,2796.04784688995,2808.95215311005,2889.05263157895,
+        2942.07655502392,3077.63636363636,3113.16746411483,3217.28708133971,
+        3264.55502392345,3314.30622009569,3378.33014354067,3563.14354066986,
+        3392.9043062201,3615.13397129187,3593.30622009569,3613.94258373206,
+        3779.3014354067,3773.54545454545,3822.08612440191,3869.44019138756,
+        3928.43062200957,4028.53588516746,3859.67942583732,3726.91866028708,
+        3627.57894736842,3537.01913875598,3425.47368421053,3385.63636363636,
+        3371.51674641148,3327.95215311005,3286.21531100479,3273.53588516746,
+        3219.12440191388,3201.99043062201,3166.33971291866,3158.02870813397,
+        3030.7990430622,3080.71291866029,3087.54066985646,3092.36363636364,
+        3112.03827751196,3131.14832535885,3069.49282296651,3019.66985645933,
+        3158.87559808612,3217.53588516746,3182.51674641148,3241.75119617225,
+        3165.0956937799,3183.65071770335,3147.15789473684,3157.17224880383,
+        3107.97129186603,3084.54545454545,3056.37799043062,3064.67942583732,
+        2988.66985645933,3023.48803827751,2989.89473684211,2929.58373205742,
+        2956.58851674641,2896.17703349282,2872.22009569378,2861.61244019139,
+        2862.90909090909,2831.05741626794,2799.88038277512,2781.11961722488,
+        2670.96172248804,2639.2009569378,2629.74641148325,2558.95693779904,
+        2525.83732057416,2447.47846889952,2366.4976076555,2311.54066985646,
+        2240.41626794258,2071.95215311005,1902.68899521531,1833.71770334928,
+        1768.63157894737,1729.995215311,1604.61722488038,1495.90909090909,
+        1407.67942583732,1334.91866028708,1243.22488038278,1178.88995215311
+    ],
+    dtype=np.float32
+)
+
 # ---------------------------------------------------------------------------
 # Geometry helpers
 # ---------------------------------------------------------------------------
@@ -109,7 +142,7 @@ class BRConfig:
     smoothing_sigma: float = 0.2
     """Gaussian smoothing sigma before differentiation."""
 
-    minmax_window_px: int = 50
+    minmax_window_px: int = 10
     """Sliding window width for local min-max normalisation."""
 
     distort_coeff: float = 0.0
@@ -162,7 +195,7 @@ class EdgeDetectionResult:
     first_derivative:    np.ndarray
     second_derivative:   np.ndarray
     smoothed_signal:     np.ndarray
-    local_norm_signal:   np.ndarray
+    vignette_norm:   np.ndarray
 
     detected_edges:  List[DetectedEdge]
     bit_width_px:    float
@@ -444,11 +477,11 @@ def detect_edges(
     # Steps 1-3
     sig_norm   = normalize_global(undist)
     sig_smooth = gaussian_filter1d(sig_norm, sigma=config.smoothing_sigma)
-    local_norm = apply_minmax_normalization(sig_smooth, config.minmax_window_px)
+    vignette_norm = normalize_global(sig_smooth / VIGNETTE)
 
     # Steps 4-5
     kernel = make_br_kernel(config.filter_order)
-    d1     = correlate_mirror(local_norm, kernel)
+    d1     = correlate_mirror(vignette_norm, kernel)
     d2     = correlate_mirror(d1, kernel)
 
     # Step 6
@@ -469,7 +502,7 @@ def detect_edges(
         first_derivative=d1,
         second_derivative=d2,
         smoothed_signal=sig_smooth,
-        local_norm_signal=local_norm,
+        vignette_norm=vignette_norm,
         detected_edges=edges,
         bit_width_px=config.bit_width_px,
         peak_threshold=peak_thr,
