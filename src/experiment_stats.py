@@ -85,7 +85,6 @@ def run_single_test(config: dict, repeat_id: int):
         sim_result.adc_signal,
         sim_result.bits,
         sim_result.true_edges,
-        sim_config.distort_coeff,
         br_config,
     )
 

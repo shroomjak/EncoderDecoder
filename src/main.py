@@ -69,7 +69,8 @@ def main(
         min_edge_distance_factor=min_dist / 100.0,
         bit_width_px=bit_width,
         smoothing_sigma=smoothing,
-        minmax_window_px=minmax_window
+        minmax_window_px=minmax_window,
+        distort_coeff=distort
     )
     
     # Запуск

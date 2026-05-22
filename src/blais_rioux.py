@@ -1,799 +1,548 @@
 """
-blais_rioux.py — Модуль обработки сигнала методом Blais-Rioux
+blais_rioux.py — Blais-Rioux edge detector + bit recovery.
 
-Алгоритм:
-1. Глобальная нормализация сигнала
-2. Гауссово сглаживание (подавление шума)
-3. КИХ фильтр D1 (моментное ядро Blais-Rioux): h[k] = k / Σk²
-4. КИХ фильтр D2 = D1(D1(signal))
-5. Поиск нулей D2 с линейной интерполяцией: pos = x_A + A/(A-B)
-6. Определение ROI по детектированным фронтам
-7. Минимаксная нормализация внутри ROI
-8. Восстановление бит по знаку D1 на фронтах:
-   - D1 > 0 → сигнал возрастает → переход 0→1 → после фронта бит = 1
-   - D1 < 0 → сигнал убывает → переход 1→0 → после фронта бит = 0
-9. Измерение периода: для каждого сегмента period_i = distance_i / nBits_i
+Pipeline overview
+-----------------
+detect_edges(adc_signal, config):
+    0. Undistort signal via division model (if config.distort_coeff != 0).
+       Geometry-correct: N pixels -> M pixels, same 1-px scale, bicubic spline.
+       undistorted_signal stored in EdgeDetectionResult has length M.
+    1. Global normalisation
+    2. Gaussian smoothing
+    3. Local min-max normalisation (sliding window)
+    4. D1 -- BR moment filter
+    5. D2 = D1(D1)
+    6. Zero-crossings of D2 -> candidate edges
+    7. Amplitude threshold on |D1|
+    8. Min-distance filter
+    -> EdgeDetectionResult (all positions in undistorted M-point index space)
+
+recover_bits(edge_result, true_bits, true_edges):
+    Works entirely in undistorted M-point coordinates.
+    bit_width_px is interpreted in the new (expanded) pixel scale.
 """
+from __future__ import annotations
 
 from dataclasses import dataclass, field
 from typing import List, Optional
+
 import numpy as np
+from scipy.interpolate import CubicSpline
 from scipy.ndimage import gaussian_filter1d, maximum_filter1d, correlate1d
 
-from src.ccd_simulator import distort_division
+# ---------------------------------------------------------------------------
+# Geometry helpers
+# ---------------------------------------------------------------------------
+
+def _sensor_center_scale(n: int):
+    c = 0.5 * (n - 1)
+    return c, max(c, 1.0)
+
+def _undistort_and_resample(
+    signal: np.ndarray,
+    k: float,
+    output_step_px: float = 1.0,
+) -> tuple[np.ndarray, np.ndarray]:
+    """
+    Geometry-correct 1-D undistortion (division model).
+
+    Algorithm
+    ---------
+    1. Source uniform grid x_d = 0..N-1 (distorted sensor).
+    2. Inverse transform: x_u = undistort(x_d) -- non-uniform.
+    3. New uniform grid x_u_new with step output_step_px,
+       spanning [min(x_u), max(x_u)]. Length M >= N.
+    4. Natural cubic spline interpolation: signal(x_u) -> x_u_new.
+
+    Returns
+    -------
+    x_u_new : ndarray (M,)  -- new axis in pixel units (step = output_step_px)
+    undist  : ndarray (M,)  -- undistorted signal values
+    """
+    signal = np.asarray(signal, dtype=np.float64)
+    n = len(signal)
+    if n < 2 or abs(k) < 1e-15:
+        return np.arange(n, dtype=np.float64), signal.copy()
+
+    if output_step_px <= 0:
+        raise ValueError("output_step_px must be > 0")
+
+    c, s = _sensor_center_scale(n)
+    x_d_norm = (np.arange(n, dtype=np.float64) - c) / s
+
+    # Inverse division model: x_u = 2*x_d / (1 + sqrt(1 - 4*k*x_d^2))
+    disc    = np.clip(1.0 - 4.0 * k * x_d_norm ** 2, 0.0, None)
+    x_u_norm = 2.0 * x_d_norm / (1.0 + np.sqrt(disc))
+    x_u_px   = x_u_norm * s + c  # non-uniform grid in undistorted space
+
+    # New uniform grid spanning the same range
+    x_min, x_max = float(x_u_px[0]), float(x_u_px[-1])
+    m = int(np.floor((x_max - x_min) / output_step_px)) + 1
+    x_u_new = x_min + np.arange(m, dtype=np.float64) * output_step_px
+
+    # Natural cubic spline interpolation
+    spline = CubicSpline(x_u_px, signal, bc_type="natural")
+    undist = spline(x_u_new)
+
+    return x_u_new, undist
+
+# ---------------------------------------------------------------------------
+# Configuration
+# ---------------------------------------------------------------------------
 
 @dataclass
 class BRConfig:
-    """Конфигурация BR."""
-    
+    """Blais-Rioux detector configuration."""
+
     filter_order: int = 2
-    """Порядок КИХ фильтра N (длина ядра 2N+1): 2 или 4."""
-
-    roi_start: Optional[float] = None
-    """Начало ROI в пикселях. None — авто (позиция первого фронта)."""
-
-    roi_end: Optional[float] = None
-    """Конец ROI в пикселях. None — авто (позиция последнего фронта)."""
+    """|KIR kernel order N (kernel length = 2N+1): 2 or 4."""
 
     peak_threshold_rel: float = 0.25
-    """Порог |D1| относительно максимума (0..1)."""
-    
-    min_edge_distance_factor: float = 0.3
-    """Минимальное расстояние между фронтами как доля от bit_width_px."""
-    
-    bit_width_px: float = 5
-    """Априорная ширина бита в пикселях."""
-    
-    smoothing_sigma: float = 0.2
-    """Cглаживания перед дифференцированием."""
-    
-    minmax_window_px: int = 50
-    """Ширина окна для скользящего min/max нормирования."""
+    """|D1| threshold relative to maximum (0..1)."""
 
+    min_edge_distance_factor: float = 0.3
+    """Minimum inter-edge distance as a fraction of bit_width_px."""
+
+    bit_width_px: float = 5
+    """Prior bit width in undistorted pixels."""
+
+    smoothing_sigma: float = 0.2
+    """Gaussian smoothing sigma before differentiation."""
+
+    minmax_window_px: int = 50
+    """Sliding window width for local min-max normalisation."""
+
+    distort_coeff: float = 0.0
+    """Division-model coefficient k. 0 = no correction.
+    When non-zero, the signal is geometry-corrected (N->M, bicubic spline)
+    before all further processing. All subsequent coordinates are M-point."""
+
+    undist_output_step_px: float = 1.0
+    """Output grid step for undistortion (normally 1.0 -- one pixel)."""
+
+# ---------------------------------------------------------------------------
+# Data classes
+# ---------------------------------------------------------------------------
 
 @dataclass
 class DetectedEdge:
-    """Детектированный фронт."""
-    
-    position: float
-    """Субпиксельная позиция фронта."""
-    
-    d1_value: float
-    """Значение D1 в этой точке (знак = направление перехода)."""
-
+    position:  float   # sub-pixel index in undistorted M-point coordinates
+    d1_value:  float   # D1 at this position (sign = transition direction)
 
 @dataclass
 class BitSegment:
-    """Сегмент восстановленных бит между двумя фронтами."""
-
-    start_pos: float
-    """Видимая начальная позиция сегмента."""
-
-    end_pos: float
-    """Видимая конечная позиция сегмента."""
-
-    bit_value: int
-    """Значение бита: 0 или 1."""
-
-    n_bits: int
-    """Количество бит в сегменте."""
-
-    distance: float
-    """Видимая длина сегмента в пикселях."""
-
+    start_pos:       float
+    end_pos:         float
+    bit_value:       int
+    n_bits:          int
+    distance:        float
     measured_period: float
-    """Период бита, использованный при разбиении сегмента."""
+    grid_start_pos:  Optional[float] = None
 
-    grid_start_pos: Optional[float] = None
-    """Опорная позиция начала битовой сетки для интерполяции.
-
-    Если None, используется start_pos.
-    Для левого сегмента у ROI это позволяет якорить сетку на первом фронте,
-    а не на roi_start, поскольку граница ROI может разрезать бит.
-    """
-
-
-@dataclass  
+@dataclass
 class RecoveredBit:
-    """Восстановленный бит с координатой."""
-    
-    value: int
-    """Значение бита: 0 или 1."""
-    
-    position: float
-    """Позиция начала бита (интерполированная)."""
-    
+    value:       int
+    position:    float   # undistorted pixel index
     segment_idx: int
-    """Индекс сегмента, которому принадлежит бит."""
-
 
 @dataclass
 class EdgeDetectionResult:
-    """Результат детектирования фронтов (без бит)."""
-    first_derivative: np.ndarray
-    second_derivative: np.ndarray
-    smoothed_signal: np.ndarray
-    local_norm_signal: np.ndarray
-    detected_edges: List[DetectedEdge]
-    bit_width_px: float
-    roi_start: float
-    roi_end: float
-    peak_threshold: float
-    config: BRConfig = field(repr=False)
+    """Output of detect_edges().
 
+    raw_signal         -- original ADC values,         length N
+    undistorted_signal -- after bicubic undistortion,  length M  (M >= N)
+    undist_x           -- uniform x-axis for undistorted_signal (pixel units)
+
+    All edge / bit positions are indices 0..M-1 into undistorted_signal.
+    """
+    raw_signal:          np.ndarray   # float64, shape (N,)
+    undistorted_signal:  np.ndarray   # float64, shape (M,)
+    undist_x:            np.ndarray   # float64, shape (M,)
+
+    first_derivative:    np.ndarray
+    second_derivative:   np.ndarray
+    smoothed_signal:     np.ndarray
+    local_norm_signal:   np.ndarray
+
+    detected_edges:  List[DetectedEdge]
+    bit_width_px:    float
+    peak_threshold:  float
+    config:          BRConfig = field(repr=False)
 
 @dataclass
 class BitRecoveryResult:
-    """Результат восстановления бит по фронтам."""
-    # Ссылка на результат детектирования
+    """Output of recover_bits()."""
     edge_result: EdgeDetectionResult
 
     measured_bit_period: float
-    bit_segments: List[BitSegment]
-    recovered_bits: List[RecoveredBit]
+    bit_segments:        List[BitSegment]
+    recovered_bits:      List[RecoveredBit]
     recovered_bit_values: np.ndarray
 
-    # Метрики
-    bit_errors: int
-    edge_errors: np.ndarray
+    bit_errors:    int
+    edge_errors:   np.ndarray
     rms_edge_error: float
-    accuracy: float
+    accuracy:      float
 
+    # Convenience forwarding from EdgeDetectionResult
     @property
-    def first_derivative(self): return self.edge_result.first_derivative
+    def raw_signal(self):           return self.edge_result.raw_signal
     @property
-    def second_derivative(self): return self.edge_result.second_derivative
+    def undistorted_signal(self):   return self.edge_result.undistorted_signal
     @property
-    def smoothed_signal(self): return self.edge_result.smoothed_signal
+    def undist_x(self):             return self.edge_result.undist_x
     @property
-    def local_norm_signal(self): return self.edge_result.local_norm_signal
+    def first_derivative(self):     return self.edge_result.first_derivative
     @property
-    def detected_edges(self): return self.edge_result.detected_edges
+    def second_derivative(self):    return self.edge_result.second_derivative
     @property
-    def bit_width_px(self): return self.edge_result.bit_width_px
+    def smoothed_signal(self):      return self.edge_result.smoothed_signal
     @property
-    def roi_start(self): return self.edge_result.roi_start
+    def local_norm_signal(self):    return self.edge_result.local_norm_signal
     @property
-    def roi_end(self): return self.edge_result.roi_end
+    def detected_edges(self):       return self.edge_result.detected_edges
     @property
-    def peak_threshold(self): return self.edge_result.peak_threshold
+    def bit_width_px(self):         return self.edge_result.bit_width_px
     @property
-    def config(self): return self.edge_result.config
+    def peak_threshold(self):       return self.edge_result.peak_threshold
+    @property
+    def config(self):               return self.edge_result.config
 
+# ---------------------------------------------------------------------------
+# DSP primitives
+# ---------------------------------------------------------------------------
 
 def make_br_kernel(order: int) -> np.ndarray:
-    """
-    Создаёт КИХ ядро BR для первой производной.
-    
-    h[k] = k / sum|k|, k in {-1, 1}
-    
-    Моментный фильтр, дающий положительное значение при
-    возрастании сигнала и отрицательное при убывании.
-    
-    Parameters
-    ----------
-    order : int
-        Порядок фильтра.
-
-    Returns
-    -------
-    np.ndarray
-        Ядро фильтра длиной 2*order + 1.
-    """
-    k = np.array([-1] * order + [0] + [1] * order)
-    norm_l1 = np.sum(abs(k))
-    return k / norm_l1
-
+    k = np.array([-1] * order + [0] + [1] * order, dtype=np.float64)
+    return k / np.sum(np.abs(k))
 
 def correlate_mirror(signal: np.ndarray, kernel: np.ndarray) -> np.ndarray:
-    """
-    Корреляция сигнала с ядром (зеркальные граничные условия).
-
-    Parameters
-    ----------
-    signal : np.ndarray
-        Входной сигнал.
-    kernel : np.ndarray
-        Ядро.
-        
-    Returns
-    -------
-    np.ndarray
-        Результат корреляции той же длины, что и signal.
-    """
-    return correlate1d(signal, kernel, mode='reflect')
-
+    return correlate1d(signal, kernel, mode="reflect")
 
 def normalize_global(signal: np.ndarray) -> np.ndarray:
-    """
-    Глобальная нормализация сигнала к диапазону [0, 1].
-    
-    Parameters
-    ----------
-    signal : np.ndarray
-        Входной сигнал.
-        
-    Returns
-    -------
-    np.ndarray
-        Нормализованный сигнал.
-    """
     s_min, s_max = signal.min(), signal.max()
     return (signal - s_min) / (s_max - s_min + 1e-12)
 
+def apply_minmax_normalization(signal: np.ndarray, window_size: int) -> np.ndarray:
+    global_min  = float(signal.min())
+    running_max = maximum_filter1d(signal, size=window_size, mode="reflect")
+    local_max   = np.maximum(running_max, 0.5)
+    return (signal - global_min) / (local_max - global_min + 1e-12)
 
-def apply_minmax_normalization(
-    signal: np.ndarray,
-    window_size: int
-) -> np.ndarray:
-    """
-    Минимаксная нормализация по скользящему окну внутри ROI.
-    
-    normalized[i] = (signal[i] - global_min) / (running_max[i] - global_min)
-    
-    Parameters
-    ----------
-    signal : np.ndarray
-        Входной сигнал.
-    window_size : int
-        Ширина скользящего окна.
-        
-    Returns
-    -------
-    np.ndarray
-        Нормализованный сигнал.
-    """
-    n = len(signal)
-    
-    # Скользящие min/max
-    global_min = min(signal)
-    running_max = maximum_filter1d(signal, size=window_size, mode='reflect')
-    
-    # Нормализация только внутри ROI
-    normalized = signal.copy()
-    for i in range(len(normalized)):
-        local_max = max(running_max[i], 0.5)
-        range_val = local_max - global_min + 1e-12
-        normalized[i] = (signal[i] - global_min) / range_val
-    
-    return normalized
-
-
-def find_zero_crossings_d2(
-    d2: np.ndarray,
-    d1: np.ndarray
-) -> List[DetectedEdge]:
-    """
-    Поиск нулей D2 с линейной интерполяцией.
-    
-    Формула: pos = i + A / (A - B), где A = D2[i], B = D2[i+1], A*B < 0.
-    
-    Нули D2 соответствуют экстремумам D1, т.е. позициям фронтов.
-    
-    Parameters
-    ----------
-    d2 : np.ndarray
-        Вторая производная.
-    d1 : np.ndarray
-        Первая производная.
-        
-    Returns
-    -------
-    List[DetectedEdge]
-        Список детектированных фронтов.
-    """
+def find_zero_crossings_d2(d2: np.ndarray, d1: np.ndarray) -> List[DetectedEdge]:
+    """Sub-pixel zero-crossings of D2. Positions are indices 0..M-1."""
+    signs = np.sign(d2)
+    cross = np.where((signs[:-1] * signs[1:]) < 0)[0]
     edges = []
-    n = len(d2)
-    
-    for i in range(n - 1):
-        left = d2[i]
-        right = d2[i + 1]
-
-        if left * right < 0:
-            pos = i + left / (left - right)
-            
-            # Интерполяция D1 в этой точке
-            frac = pos - i
-            d1_at_pos = d1[i] * (1 - frac) + d1[i + 1] * frac
-            
-            edges.append(DetectedEdge(
-                position=pos,
-                d1_value=d1_at_pos,
-            ))
-    
+    for i in cross:
+        pos  = i + d2[i] / (d2[i] - d2[i + 1])
+        frac = pos - i
+        d1v  = d1[i] * (1 - frac) + d1[i + 1] * frac
+        edges.append(DetectedEdge(position=pos, d1_value=d1v))
     return edges
 
-
 def filter_by_min_distance(
-    edges: List[DetectedEdge],
-    min_dist: float
+    edges: List[DetectedEdge], min_dist: float
 ) -> List[DetectedEdge]:
-    """
-    Фильтрация фронтов по минимальному расстоянию.
-    
-    При конфликте оставляем фронт с большей амплитудой |D1|.
-    
-    Parameters
-    ----------
-    edges : List[DetectedEdge]
-        Список фронтов.
-    min_dist : float
-        Минимальное допустимое расстояние.
-        
-    Returns
-    -------
-    List[DetectedEdge]
-        Отфильтрованный список.
-    """
     if not edges:
         return []
-    
-    sorted_edges = sorted(edges, key=lambda e: e.position)
-    result = [sorted_edges[0]]
-    
-    for curr in sorted_edges[1:]:
-        prev = result[-1]
-        dist = curr.position - prev.position
-        
-        if dist < min_dist:
-            # Оставляем более сильный фронт
-            if abs(curr.d1_value) > abs(prev.d1_value):
+    result = [sorted(edges, key=lambda e: e.position)[0]]
+    for curr in sorted(edges, key=lambda e: e.position)[1:]:
+        if curr.position - result[-1].position < min_dist:
+            if abs(curr.d1_value) > abs(result[-1].d1_value):
                 result[-1] = curr
         else:
             result.append(curr)
-    
     return result
 
-def estimate_local_distorted_bit_width(
-    mid_pos: float,
-    bit_width_px: float,
-    n_pixels: int,
-    distort_coeff: float
-) -> float:
-    """
-    Оценка локальной ширины бита с учётом дисторсии.
+# ---------------------------------------------------------------------------
+# Bit-segment helpers (all in undistorted M-point index space)
+# ---------------------------------------------------------------------------
 
-    Parameters
-    ----------
-    mid_pos : float
-        Центр сегмента в пикселях.
-    bit_width_px : float
-        Априорная ширина бита.
-    n_pixels : int
-        Длина сигнала.
-    distort_coeff : float
-        Коэффициент дисторсии.
-
-    Returns
-    -------
-    float
-        Локальная оценка ширины бита в пикселях.
-    """
-    center = n_pixels / 2
-    pos = mid_pos + distort_coeff
-    width = (
-        distort_division(pos + bit_width_px, center, center, distort_coeff)
-        - distort_division(pos, center, center, distort_coeff)
-    )
-    return max(abs(width), 1e-12)
-
-
-def estimate_roi_segment_n_bits(
-    visible_distance: float,
-    reference_period: float
-) -> int:
-    """
-    Оценка количества бит в сегменте, примыкающем к ROI.
-
-    Для крайних сегментов нельзя использовать round(distance / T), потому что
-    граница ROI может проходить внутри бита. В таком случае видимая длина
-    сегмента равна:
-
-        visible_distance = N * T - delta,  0 <= delta < T
-
-    где N — число бит, пересекающих ROI. Поэтому нужно использовать ceil.
-
-    Parameters
-    ----------
-    visible_distance : float
-        Видимая длина сегмента внутри ROI.
-    reference_period : float
-        Средняя оценка ширины бита.
-
-    Returns
-    -------
-    int
-        Количество бит, пересекающих ROI в данном сегменте.
-    """
+def _estimate_segment_n_bits(visible_distance: float, reference_period: float) -> int:
     if visible_distance <= 1e-12:
         return 0
+    return max(1, int(np.ceil((visible_distance - 1e-9) / max(reference_period, 1e-12))))
 
-    ref = max(reference_period, 1e-12)
-    return max(1, int(np.ceil((visible_distance - 1e-9) / ref)))
-
-
-def build_internal_bit_segments(
+def _build_internal_segments(
     edges: List[DetectedEdge],
     bit_width_px: float,
-    n_pixels: int,
-    distort_coeff: float
 ) -> List[BitSegment]:
-    """
-    Построение внутренних сегментов между соседними фронтами.
-
-    Эти сегменты ограничены реальными фронтами с обеих сторон, поэтому для них
-    число бит можно оценивать стандартно:
-    - локальная ширина бита -> с учётом дисторсии
-    - n_bits = round(distance / local_bit_width)
-    """
-    if len(edges) < 2:
-        return []
-
-    sorted_edges = sorted(edges, key=lambda e: e.position)
-    segments = []
-
-    for edge, next_edge in zip(sorted_edges[:-1], sorted_edges[1:]):
-        start_pos = edge.position
-        end_pos = next_edge.position
-        distance = end_pos - start_pos
-
-        local_bw = estimate_local_distorted_bit_width(
-            mid_pos=(start_pos + end_pos) / 2,
-            bit_width_px=bit_width_px,
-            n_pixels=n_pixels,
-            distort_coeff=distort_coeff,
-        )
-
-        if abs(distance) <= 0.5 * local_bw:
+    segs = []
+    for e, ne in zip(edges[:-1], edges[1:]):
+        d = ne.position - e.position
+        if d <= 0.5 * bit_width_px:
             continue
-
-        n_bits = max(1, int(round(distance / local_bw)))
-        bit_value = 1 if edge.d1_value > 0 else 0
-
-        segments.append(BitSegment(
-            start_pos=start_pos,
-            end_pos=end_pos,
-            bit_value=bit_value,
-            n_bits=n_bits,
-            distance=distance,
-            measured_period=distance / n_bits,
+        n = max(1, int(round(d / bit_width_px)))
+        segs.append(BitSegment(
+            start_pos=e.position,
+            end_pos=ne.position,
+            bit_value=1 if e.d1_value > 0 else 0,
+            n_bits=n,
+            distance=d,
+            measured_period=d / n,
         ))
+    return segs
 
-    return segments
+def _compute_mean_period(segments: List[BitSegment]) -> float:
+    total_p = sum(s.measured_period * s.n_bits for s in segments)
+    total_n = sum(s.n_bits for s in segments)
+    return total_p / total_n if total_n > 0 else 0.0
 
 def build_bit_segments(
     edges: List[DetectedEdge],
     bit_width_px: float,
-    n_pixels: int,
-    distort_coeff: float,
-    roi_start: float,
-    roi_end: float
+    signal_start: float,
+    signal_end: float,
 ) -> List[BitSegment]:
-    """
-    Построение сегментов бит из фронтов.
-
-    Логика восстановления:
-    1. внутренние сегменты между соседними фронтами строятся по локальной
-       оценке ширины бита;
-    2. сегменты, примыкающие к границам ROI, строятся отдельно:
-       - значение бита определяется по ближайшему фронту;
-       - число бит считается по средней оценке периода;
-       - битовая сетка якорится на ближайшем фронте, а не на границе ROI.
-    """
-    if not edges or roi_end <= roi_start:
+    if not edges or signal_end <= signal_start:
         return []
 
     sorted_edges = sorted(edges, key=lambda e: e.position)
-    segments: List[BitSegment] = []
+    internal     = _build_internal_segments(sorted_edges, bit_width_px)
+    ref_period   = _compute_mean_period(internal)
+    if ref_period <= 0:
+        ref_period = bit_width_px
 
-    # 1) Сначала восстанавливаем только внутренние сегменты между фронтами
-    internal_segments = build_internal_bit_segments(
-        sorted_edges,
-        bit_width_px=bit_width_px,
-        n_pixels=n_pixels,
-        distort_coeff=distort_coeff,
-    )
+    segs: List[BitSegment] = []
 
-    # 2) Средняя оценка периода нужна именно для крайних сегментов у ROI
-    reference_period = compute_mean_measured_period(internal_segments)
-    if reference_period <= 0:
-        reference_period = bit_width_px
-
-    # 3) Левый сегмент: roi_start -> первый фронт
-    # Значение бита определяется по направлению первого фронта:
-    #   D1 < 0 : 1 -> 0, значит слева был бит 1
-    #   D1 > 0 : 0 -> 1, значит слева был бит 0
-    first_edge = sorted_edges[0]
-    left_visible_distance = first_edge.position - roi_start
-    if left_visible_distance > 1e-12:
-        left_bit = 1 if first_edge.d1_value < 0 else 0
-        left_n_bits = estimate_roi_segment_n_bits(
-            left_visible_distance,
-            reference_period
-        )
-
-        if left_n_bits > 0:
-            # Сетка ставится от фронта назад, а не от roi_start.
-            left_grid_start = first_edge.position - left_n_bits * reference_period
-            segments.append(BitSegment(
-                start_pos=roi_start,
-                end_pos=first_edge.position,
-                bit_value=left_bit,
-                n_bits=left_n_bits,
-                distance=left_visible_distance,
-                measured_period=reference_period,
-                grid_start_pos=left_grid_start,
+    fe     = sorted_edges[0]
+    left_d = fe.position - signal_start
+    if left_d > 1e-12:
+        n = _estimate_segment_n_bits(left_d, ref_period)
+        if n > 0:
+            segs.append(BitSegment(
+                start_pos=signal_start,
+                end_pos=fe.position,
+                bit_value=1 if fe.d1_value < 0 else 0,
+                n_bits=n,
+                distance=left_d,
+                measured_period=ref_period,
+                grid_start_pos=fe.position - n * ref_period,
             ))
 
-    # 4) Внутренние сегменты между фронтами
-    segments.extend(internal_segments)
+    segs.extend(internal)
 
-    # 5) Правый сегмент: последний фронт -> roi_end
-    # Значение бита определяется по направлению последнего фронта:
-    #   D1 > 0 : после фронта бит 1
-    #   D1 < 0 : после фронта бит 0
-    last_edge = sorted_edges[-1]
-    right_visible_distance = roi_end - last_edge.position
-    if right_visible_distance > 1e-12:
-        right_bit = 1 if last_edge.d1_value > 0 else 0
-        right_n_bits = estimate_roi_segment_n_bits(
-            right_visible_distance,
-            reference_period
-        )
-
-        if right_n_bits > 0:
-            # Здесь сетка естественно идёт от последнего фронта вправо.
-            segments.append(BitSegment(
-                start_pos=last_edge.position,
-                end_pos=roi_end,
-                bit_value=right_bit,
-                n_bits=right_n_bits,
-                distance=right_visible_distance,
-                measured_period=reference_period,
-                grid_start_pos=last_edge.position,
+    le      = sorted_edges[-1]
+    right_d = signal_end - le.position
+    if right_d > 1e-12:
+        n = _estimate_segment_n_bits(right_d, ref_period)
+        if n > 0:
+            segs.append(BitSegment(
+                start_pos=le.position,
+                end_pos=signal_end,
+                bit_value=1 if le.d1_value > 0 else 0,
+                n_bits=n,
+                distance=right_d,
+                measured_period=ref_period,
+                grid_start_pos=le.position,
             ))
 
-    return segments
-
+    return segs
 
 def extract_bits_with_positions(segments: List[BitSegment]) -> List[RecoveredBit]:
-    """
-    Извлечение только ПОЛНОСТЬЮ видимых битов.
-
-    Внутренняя битовая сетка сегмента может включать частично обрезанные биты
-    у границ ROI, но в recovered_bits должны попадать только те биты, которые
-    целиком лежат внутри видимой части сегмента.
-
-    Это важно для:
-    - расчёта угла;
-    - сравнения кодовых слов;
-    - отрисовки битов без краевых ошибок.
-    """
     bits = []
-
-    for seg_idx, seg in enumerate(segments):
-        if seg.n_bits <= 0:
+    for idx, seg in enumerate(segments):
+        if seg.n_bits <= 0 or seg.measured_period <= 1e-12:
             continue
-        if seg.measured_period <= 1e-12:
-            continue
-        if seg.end_pos <= seg.start_pos:
-            continue
-
-        grid_start = (
-            seg.grid_start_pos
-            if seg.grid_start_pos is not None
-            else seg.start_pos
-        )
-
+        gs  = seg.grid_start_pos if seg.grid_start_pos is not None else seg.start_pos
         eps = max(1e-9, 1e-6 * seg.measured_period)
-
         for i in range(seg.n_bits):
-            bit_start = grid_start + i * seg.measured_period
-            bit_end = bit_start + seg.measured_period
-
-            # В recovered_bits включаем только целый бит,
-            # полностью попавший в видимую часть сегмента.
-            is_full_bit_inside = (
-                bit_start >= seg.start_pos - eps and
-                bit_end <= seg.end_pos + eps
-            )
-
-            if not is_full_bit_inside:
-                continue
-
-            bits.append(RecoveredBit(
-                value=seg.bit_value,
-                position=bit_start,
-                segment_idx=seg_idx
-            ))
-
+            bs = gs + i * seg.measured_period
+            be = bs + seg.measured_period
+            if bs >= seg.start_pos - eps and be <= seg.end_pos + eps:
+                bits.append(RecoveredBit(value=seg.bit_value, position=bs, segment_idx=idx))
     bits.sort(key=lambda b: b.position)
     return bits
 
-
 def compute_mean_measured_period(segments: List[BitSegment]) -> float:
+    return _compute_mean_period(segments)
+
+# ---------------------------------------------------------------------------
+# Sliding-window bit accuracy
+# ---------------------------------------------------------------------------
+
+def _sliding_window_accuracy(
+    rec_values: np.ndarray,
+    true_bits: np.ndarray,
+) -> tuple[int, float]:
     """
-    Средний измеренный период по всем сегментам.
+    Find the best-matching position of rec_values inside true_bits
+    by sliding rec_values over true_bits (or vice versa if rec is longer).
 
-    Для крайних сегментов у ROI видимая длина может быть меньше полной длины
-    покрываемых ими битов, поэтому использовать sum(distance) / sum(n_bits)
-    нельзя — это даст занижение периода.
-
-    Здесь используется среднее по периодам сегментов с весом n_bits:
-
-        mean_period = sum(measured_period_i * n_bits_i) / sum(n_bits_i)
+    Returns
+    -------
+    best_err : int    -- number of mismatched bits at best offset
+    accuracy : float  -- percentage of correct bits (0..100)
     """
-    if not segments:
-        return 0.0
+    n_rec  = len(rec_values)
+    n_true = len(true_bits)
 
-    total_period = sum(seg.measured_period * seg.n_bits for seg in segments)
-    total_bits = sum(seg.n_bits for seg in segments)
+    if n_rec == 0 or n_true == 0:
+        return 0, 0.0
 
-    return total_period / total_bits if total_bits > 0 else 0.0
+    rec  = rec_values.astype(np.int8)
+    true = true_bits.astype(np.int8)
 
+    if n_rec <= n_true:
+        # Slide rec over true: for each offset k, count matching bits
+        win = n_rec
+        n_offsets = n_true - win + 1
+        best_matches = 0
+        for k in range(n_offsets):
+            matches = int(np.sum(rec == true[k:k + win]))
+            if matches > best_matches:
+                best_matches = matches
+        best_err = win - best_matches
+        accuracy = best_matches / win * 100.0
+    else:
+        # rec is longer than true: slide true over rec
+        win = n_true
+        n_offsets = n_rec - win + 1
+        best_matches = 0
+        for k in range(n_offsets):
+            matches = int(np.sum(true == rec[k:k + win]))
+            if matches > best_matches:
+                best_matches = matches
+        best_err = win - best_matches
+        # accuracy denominator = n_rec (we recovered more bits than ground truth)
+        accuracy = best_matches / n_rec * 100.0
+
+    return best_err, accuracy
+
+# ---------------------------------------------------------------------------
+# Public API
+# ---------------------------------------------------------------------------
 
 def detect_edges(
     adc_signal: np.ndarray,
     config: Optional[BRConfig] = None,
 ) -> EdgeDetectionResult:
     """
-    Шаги 1–10: нормализация, D1/D2, поиск нулей, фильтрация, ROI.
-    Возвращает фронты — без бит и без метрик.
+    Steps 0-8: undistort (N->M, bicubic) -> normalise -> D1/D2 -> edges.
+
+    Step 0 -- geometry-correct undistortion:
+        x_d grid (N px, distorted) -> x_u_new grid (M px, same 1-px scale).
+        M > N for pincushion distortion (k > 0).
+        Interpolation: natural cubic spline.
+        k == 0 => undistorted_signal == raw_signal, M == N.
+
+    All subsequent positions (edges, bits) are indices 0..M-1.
+    No ROI clipping — full signal width is processed.
     """
     if config is None:
         config = BRConfig()
 
-    bit_width_px = config.bit_width_px
-    n_pixels = len(adc_signal)
+    raw = adc_signal.astype(np.float64)
 
-    # 1. Глобальная нормализация
-    signal_norm = normalize_global(adc_signal.astype(np.float64))
-    # 2. Гауссово сглаживание
-    signal_smoothed = gaussian_filter1d(signal_norm, sigma=config.smoothing_sigma)
-    # 3. Минимаксная нормализация
-    local_norm_signal = apply_minmax_normalization(signal_smoothed, config.minmax_window_px)
-    # 4. D1
-    br_kernel = make_br_kernel(config.filter_order)
-    d1 = correlate_mirror(local_norm_signal, br_kernel)
-    # 5. D2
-    d2 = correlate_mirror(d1, br_kernel)
-    # 6. Нули D2
+    # Step 0 -- geometry-correct undistortion (N -> M)
+    x_u, undist = _undistort_and_resample(
+        raw, config.distort_coeff, config.undist_output_step_px
+    )
+    m = len(undist)
+
+    # Steps 1-3
+    sig_norm   = normalize_global(undist)
+    sig_smooth = gaussian_filter1d(sig_norm, sigma=config.smoothing_sigma)
+    local_norm = apply_minmax_normalization(sig_smooth, config.minmax_window_px)
+
+    # Steps 4-5
+    kernel = make_br_kernel(config.filter_order)
+    d1     = correlate_mirror(local_norm, kernel)
+    d2     = correlate_mirror(d1, kernel)
+
+    # Step 6
     raw_edges = find_zero_crossings_d2(d2, d1)
-    # 7–8. Пороговая и дистанционная фильтрация
-    max_amp = max((abs(e.d1_value) for e in raw_edges), default=0)
-    peak_threshold = max_amp * config.peak_threshold_rel
-    filtered_by_amp = [e for e in raw_edges if abs(e.d1_value) >= peak_threshold]
-    min_dist = bit_width_px * config.min_edge_distance_factor
-    filtered_edges = filter_by_min_distance(filtered_by_amp, min_dist)
-    # 9–10. ROI
-    auto_roi_start = filtered_edges[0].position if filtered_edges else 0.0
-    auto_roi_end = filtered_edges[-1].position if filtered_edges else float(n_pixels - 1)
-    roi_start = float(config.roi_start) if config.roi_start is not None else auto_roi_start
-    roi_end   = float(config.roi_end)   if config.roi_end   is not None else auto_roi_end
-    roi_start = float(np.clip(roi_start, 0.0, n_pixels - 1))
-    roi_end   = float(np.clip(roi_end,   0.0, n_pixels - 1))
-    if roi_end < roi_start:
-        roi_start, roi_end = roi_end, roi_start
-    roi_edges = [e for e in filtered_edges if roi_start <= e.position <= roi_end]
+
+    # Steps 7-8
+    max_amp  = max((abs(e.d1_value) for e in raw_edges), default=0.0)
+    peak_thr = max_amp * config.peak_threshold_rel
+    edges    = filter_by_min_distance(
+        [e for e in raw_edges if abs(e.d1_value) >= peak_thr],
+        config.bit_width_px * config.min_edge_distance_factor,
+    )
 
     return EdgeDetectionResult(
+        raw_signal=raw,
+        undistorted_signal=undist,
+        undist_x=x_u,
         first_derivative=d1,
         second_derivative=d2,
-        smoothed_signal=signal_smoothed,
-        local_norm_signal=local_norm_signal,
-        detected_edges=roi_edges,
-        bit_width_px=bit_width_px,
-        roi_start=roi_start,
-        roi_end=roi_end,
-        peak_threshold=peak_threshold,
+        smoothed_signal=sig_smooth,
+        local_norm_signal=local_norm,
+        detected_edges=edges,
+        bit_width_px=config.bit_width_px,
+        peak_threshold=peak_thr,
         config=config,
     )
 
 
 def recover_bits(
     edge_result: EdgeDetectionResult,
-    true_bits: np.ndarray,
-    true_edges: np.ndarray,
-    distort_coeff: float,
+    true_bits:   np.ndarray,
+    true_edges:  np.ndarray,
 ) -> BitRecoveryResult:
     """
-    Шаги 11–16: сегменты, биты, метрики.
-    Принимает EdgeDetectionResult + ground truth для метрик.
+    Steps 10-15: segments -> bits -> metrics.
+
+    Operates entirely in undistorted M-point index space.
+    true_edges must be in the same (undistorted) coordinates.
+    Processes the full signal width — no ROI clipping.
     """
-    roi_edges  = edge_result.detected_edges
-    bit_width_px = edge_result.bit_width_px
-    roi_start  = edge_result.roi_start
-    roi_end    = edge_result.roi_end
-    n_pixels   = len(edge_result.local_norm_signal)
+    edges  = edge_result.detected_edges
+    bw     = edge_result.bit_width_px
+    m      = len(edge_result.undistorted_signal)
 
-    # 11. Сегменты
-    bit_segments = build_bit_segments(
-        roi_edges, bit_width_px, n_pixels, distort_coeff, roi_start, roi_end
-    )
-    # 12. Средний период
-    measured_bit_period = compute_mean_measured_period(bit_segments)
-    # 13. Биты
-    recovered_bits = extract_bits_with_positions(bit_segments)
-    recovered_bit_values = np.array([b.value for b in recovered_bits])
+    # Full signal range (no ROI)
+    signal_start = 0.0
+    signal_end   = float(m - 1)
 
-    # 14–15. Ошибки бит
-    if len(true_bits) >= len(recovered_bit_values):
-        longer, shorter = true_bits, recovered_bit_values
-    else:
-        longer, shorter = recovered_bit_values, true_bits
-    window = len(shorter)
-    best_errors, best_k = window + 1, 0
-    for k in range(len(longer) - window + 1):
-        err = int(np.sum(shorter != longer[k: k + window]))
-        if err < best_errors:
-            best_errors, best_k = err, k
-    accuracy = (window - best_errors) / window * 100 if window > 0 else 0.0
+    # Step 10
+    segments = build_bit_segments(edges, bw, signal_start, signal_end)
 
-    # 16. Ошибки позиционирования фронтов
-    detected_positions = [e.position for e in roi_edges]
-    edge_errors = []
-    used = set()
+    # Step 11
+    mean_period = _compute_mean_period(segments)
+
+    # Step 12
+    rec_bits   = extract_bits_with_positions(segments)
+    rec_values = np.array([b.value for b in rec_bits])
+
+    # Steps 13-14 -- bit accuracy via corrected sliding window match
+    best_err, accuracy = _sliding_window_accuracy(rec_values, true_bits)
+
+    # Step 15 -- edge position errors (in undistorted px)
+    det_pos    = [e.position for e in edges]
+    errs, used = [], set()
     for te in true_edges:
-        if te < roi_start - bit_width_px * 0.5 or te > roi_end + bit_width_px * 0.5:
-            continue
-        best_dist, best_idx = float('inf'), -1
-        for j, dp in enumerate(detected_positions):
-            if j in used:
-                continue
-            d = abs(dp - te)
-            if d < best_dist:
-                best_dist, best_idx = d, j
-        if best_idx >= 0 and best_dist < bit_width_px * 0.5:
-            edge_errors.append(detected_positions[best_idx] - te)
-            used.add(best_idx)
-    edge_errors = np.array(edge_errors)
-    rms_edge_error = float(np.sqrt(np.mean(edge_errors ** 2))) if len(edge_errors) > 0 else 0.0
+        best_d, best_j = float("inf"), -1
+        for j, dp in enumerate(det_pos):
+            if j not in used and abs(dp - te) < best_d:
+                best_d, best_j = abs(dp - te), j
+        if best_j >= 0 and best_d < bw * 0.5:
+            errs.append(det_pos[best_j] - te)
+            used.add(best_j)
+
+    errs_arr = np.array(errs)
+    rms      = float(np.sqrt(np.mean(errs_arr ** 2))) if len(errs_arr) > 0 else 0.0
 
     return BitRecoveryResult(
         edge_result=edge_result,
-        measured_bit_period=measured_bit_period,
-        bit_segments=bit_segments,
-        recovered_bits=recovered_bits,
-        recovered_bit_values=recovered_bit_values,
-        bit_errors=best_errors,
-        edge_errors=edge_errors,
-        rms_edge_error=rms_edge_error,
+        measured_bit_period=mean_period,
+        bit_segments=segments,
+        recovered_bits=rec_bits,
+        recovered_bit_values=rec_values,
+        bit_errors=best_err,
+        edge_errors=errs_arr,
+        rms_edge_error=rms,
         accuracy=accuracy,
     )
 
 
 def detect_edges_and_recover_bits(
     adc_signal: np.ndarray,
-    true_bits: np.ndarray,
+    true_bits:  np.ndarray,
     true_edges: np.ndarray,
-    distort_coeff: float,
     config: Optional[BRConfig] = None,
-) -> "BitRecoveryResult":
-    """Обратно-совместимая обёртка = detect_edges + recover_bits."""
+) -> BitRecoveryResult:
     er = detect_edges(adc_signal, config)
-    return recover_bits(er, true_bits, true_edges, distort_coeff)
-
-
-if __name__ == "__main__":
-    # Тестовый запуск
-    from ccd_simulator import simulate_ccd, SimulatorConfig
-    
-    sim_config = SimulatorConfig(n_bits=16, seed=42)
-    sim_result = simulate_ccd(sim_config)
-
-    distort_coeff = sim_config.distort_coeff
-
-    br_config = BRConfig(bit_width_px=sim_config.bit_width_px)
-    result = detect_edges_and_recover_bits(
-        sim_result.adc_signal,
-        sim_result.bits,
-        sim_result.true_edges,
-        distort_coeff,
-        br_config
-    )
-    
-    print(f"Detected edges: {len(result.detected_edges)}")
-    print(f"Accuracy: {result.accuracy:.1f}%")
-    print(f"RMS edge error: {result.rms_edge_error:.3f} px")
-    print(f"True bits:      {''.join(str(b) for b in sim_result.bits)}")
-    print(f"Recovered bits: {''.join(str(b) for b in result.recovered_bit_values)}")
+    return recover_bits(er, true_bits, true_edges)

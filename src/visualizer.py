@@ -404,7 +404,6 @@ def run_visualization(
         sim_result.adc_signal,
         sim_result.bits,
         sim_result.true_edges,
-        sim_config.distort_coeff,
         br_config,
     )
 

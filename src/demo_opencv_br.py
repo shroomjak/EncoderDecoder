@@ -1,54 +1,47 @@
 #!/usr/bin/env python3
 """
-demo_opencv_br.py — OpenCV-визуализация алгоритма Blais-Rioux Edge Detector.
+demo_opencv_br.py — OpenCV visualisation of the Blais-Rioux Edge Detector
+with 1-D distortion correction.
 
-Структура окна (аналог demo_opencv.py из EncoderModel):
-  ┌─────────────────────────────────────────────────────┐
-  │  HEADER  — справочная текстовая информация          │
-  ├─────────────────────────────────────────────────────┤
-  │  PSEUDO-2D  — grayscale-полоса ПЗС-сигнала          │
-  ├─────────────────────────────────────────────────────┤
-  │  BIT PANEL  — нормализованный сигнал + разметка бит │
-  └─────────────────────────────────────────────────────┘
-
-CLI аналогичен demo_opencv.py: --source {sim|matrix}
-  sim    — симуляция через ccd_simulator.py + blais_rioux.py
-  matrix — реальная ПЗС-матрица через serial CSV (1+N значений на строку)
+Window layout
+-------------
+┌──────────────────────────────────────────────┐
+│ HEADER — stats, k, angle, recovered bits    │
+├──────────────────────────────────────────────┤
+│ ORIGINAL strip (raw ADC, centred)           │
+├──────────────────────────────────────────────┤
+│ CORRECTED strip (after undistortion)        │
+├──────────────────────────────────────────────┤
+│ BIT PANEL — undistorted signal + bit marks  │
+└──────────────────────────────────────────────┘
 """
-
 from __future__ import annotations
 
 import argparse
 import sys
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace as _replace
 from typing import Optional, Tuple
-import serial as _serial_module
+
 import cv2
 import numpy as np
+import serial as _serial_module
 
-# ---------------------------------------------------------------------------
-# Попытка импортировать зависимости из пакета EncoderDecoder.
-# Скрипт предполагается запускать из корня репозитория EncoderDecoder.
-# ---------------------------------------------------------------------------
 from src.ccd_simulator import SimulatorConfig, simulate_ccd
 from src.blais_rioux import (
     BRConfig,
-    detect_edges_and_recover_bits,
-    EdgeDetectionResult, BitRecoveryResult, apply_minmax_normalization,
+    BitRecoveryResult,
+    apply_minmax_normalization,
+    detect_edges,
+    recover_bits,
 )
 from src.disk_angle_estimator import (
     AngleEstimationResult,
     build_code_angle_map,
     estimate_disk_angle_from_result,
 )
+from src.distortion.math1d import restore_signal_1d
 
-# ============================================================
-# Постоянные параметры углового кодирования диска
-# ============================================================
-
-# Полная циклическая кодовая последовательность, нанесённая на диск.
-# ВАЖНО: заменить на реальную последовательность вашего диска.
 FULL_DISK_CODE_SEQUENCE = (
     "100001011100001100100001101100001110100001111100010001100010010100"
     "010011100010100100010101100010110100010111100011001100011010100011"
@@ -58,726 +51,433 @@ FULL_DISK_CODE_SEQUENCE = (
     "111111101010101101010111101011011101011101101011111101101101111101"
     "1101111011111111"
 )
-
-# Полное число бит на кодовой дорожке диска.
-# Обычно равно len(FULL_DISK_CODE_SEQUENCE).
 TOTAL_CODE_BITS_ON_DISK = len(FULL_DISK_CODE_SEQUENCE)
-
-# Длина одного кодового слова, m.
-# Должно выполняться:
-#   1 <= CODEWORD_LENGTH_BITS <= TOTAL_CODE_BITS_ON_DISK
-# и все циклические слова длины m должны быть уникальны.
 CODEWORD_LENGTH_BITS = 9
-
-# Угловой период диска.
 ANGLE_PERIOD_DEG = 360.0
-
-# Центр ПЗС-матрицы в пикселях.
-# None означает использовать геометрический центр:
-#   (n_pixels - 1) / 2
 SENSOR_CENTER_PIXEL = None
-
-# Коэффициент пересчёта пикселей в градусы, k.
-#
-# Если задано число, используется оно:
-#   angle_abs = angle_code_center - ANGLE_PER_SENSOR_PIXEL_DEG * delta_px
-#
-# Если None, коэффициент оценивается автоматически по измеренному периоду бита:
-#   k = ANGLE_AXIS_SIGN * ANGLE_PERIOD_DEG / (TOTAL_CODE_BITS_ON_DISK * measured_bit_period_px)
-#
-# Для обратного направления оси можно:
-#   - либо поставить ANGLE_AXIS_SIGN = -1.0 при автоматическом k,
-#   - либо задать ANGLE_PER_SENSOR_PIXEL_DEG отрицательным числом.
 ANGLE_PER_SENSOR_PIXEL_DEG = None
-
-# Знак направления оси ПЗС относительно направления увеличения угла на диске.
-# Используется только если ANGLE_PER_SENSOR_PIXEL_DEG is None.
 ANGLE_AXIS_SIGN = -1.0
-
-# Если нужно временно отключить расчёт угла, поставить False.
 ENABLE_ANGLE_ESTIMATION = True
+DISTORT_K: float = 0.0
 
-# ============================================================
-# Вспомогательные типы
-# ============================================================
 
 @dataclass
 class FramePacket:
-    """Один кадр данных с ПЗС-линейки."""
     row_index: int
-    pixels: np.ndarray      # float32, длина = n_pixels
+    pixels: np.ndarray
     source_label: str
 
 
-@dataclass
-class Layout:
-    """Геометрия окна."""
-    width: int
-    header_h: int
-    strip_h: int
-    bit_h: int
-    n_pixels: int           # длина сигнала
-
-
-# ============================================================
-# AutoRange: экспоненциально сглаженный диапазон
-# ============================================================
-
 class AutoRange:
-    """EMA-скользящий диапазон для авто-масштабирования."""
-
-    def __init__(self, alpha: float = 0.15):
+    def __init__(self, alpha: float = 0.15) -> None:
         self.alpha = alpha
-        self._low: Optional[float] = None
-        self._high: Optional[float] = None
+        self._lo: Optional[float] = None
+        self._hi: Optional[float] = None
 
     def update(self, values: np.ndarray) -> Tuple[float, float]:
         lo = float(np.percentile(values, 1))
         hi = float(np.percentile(values, 99))
-        if self._low is None:
-            self._low, self._high = lo, hi
+        if self._lo is None:
+            self._lo, self._hi = lo, hi
         else:
             a = self.alpha
-            self._low  = (1 - a) * self._low  + a * lo
-            self._high = (1 - a) * self._high + a * hi
-        if self._high - self._low < 1e-6:
-            self._high = self._low + 1.0
-        return self._low, self._high
+            self._lo = (1 - a) * self._lo + a * lo
+            self._hi = (1 - a) * self._hi + a * hi
+        if self._hi - self._lo < 1e-6:
+            self._hi = self._lo + 1.0
+        return self._lo, self._hi
 
 
-# ============================================================
-# Утилиты рисования
-# ============================================================
-
-FONT      = cv2.FONT_HERSHEY_SIMPLEX
-FONT_MONO = cv2.FONT_HERSHEY_PLAIN       # чуть уже для кода
-
-COLOR_BG     = (245, 245, 245)
-COLOR_TEXT   = (30,  30,  30)
-COLOR_MUTED  = (120, 120, 120)
-COLOR_ROI    = (180,  30,  30)           # BGR — тёмно-красный
-COLOR_RISING = (20,  140, 220)           # BGR — синий (переход 0→1)
-COLOR_FALL   = (200, 100,  20)           # BGR — оранжевый (переход 1→0)
-COLOR_EDGE   = (100, 100, 100)
-COLOR_OK     = (40,  160,  40)
-COLOR_ERR    = (30,   30, 200)
-COLOR_GRID   = (200, 200, 200)
-COLOR_RECOV  = (220,  80,  20)           # BGR — оранжевый (восстан. бит)
+FONT = cv2.FONT_HERSHEY_SIMPLEX
+COLOR_TEXT = (30, 30, 30)
+COLOR_MUTED = (120, 120, 120)
+COLOR_ROI = (180, 30, 30)
+COLOR_RISE = (20, 140, 220)
+COLOR_FALL = (200, 100, 20)
+COLOR_EDGE = (100, 100, 100)
+COLOR_OK = (40, 160, 40)
+COLOR_ERR = (30, 30, 200)
+COLOR_GRID = (200, 200, 200)
+COLOR_REC = (220, 80, 20)
+COLOR_UNDIST_LABEL = (20, 120, 20)
 
 
-def _put(img: np.ndarray, text: str, x: int, y: int,
-         color=COLOR_TEXT, scale: float = 0.45, thickness: int = 1) -> None:
-    cv2.putText(img, text, (x, y), FONT, scale, color, thickness, cv2.LINE_AA)
+def _put(img, text, x, y, color=COLOR_TEXT, scale=0.45, thick=1):
+    cv2.putText(img, text, (x, y), FONT, scale, color, thick, cv2.LINE_AA)
 
 
 def _x_mapper(n_pixels: int, width: int, left_pad: int = 0):
-    """Возвращает функцию перевода пиксель-ПЗС → x-координата на холсте."""
     plot_w = max(1, width - left_pad)
+    denom = max(1, n_pixels - 1)
 
     def _map(px: float) -> int:
-        t = float(np.clip(px / (n_pixels - 1), 0.0, 1.0))
+        t = float(np.clip(px / denom, 0.0, 1.0))
         return int(round(left_pad + t * (plot_w - 1)))
 
     return _map
 
 
-def normalize_pixels(pixels: np.ndarray, lo: float, hi: float,
-                     invert: bool = False) -> np.ndarray:
+def normalize_pixels(pixels: np.ndarray, lo: float, hi: float, invert: bool = False) -> np.ndarray:
     scaled = np.clip((pixels - lo) / max(hi - lo, 1e-6), 0.0, 1.0)
     gray = (scaled * 255).astype(np.uint8)
     return 255 - gray if invert else gray
 
 
-# ============================================================
-# Панели
-# ============================================================
+def draw_strip_2d(
+    pixels: np.ndarray,
+    lo: float,
+    hi: float,
+    canvas_width: int,
+    height: int,
+    invert: bool = False,
+    natural_width: int | None = None,
+    label: str = "",
+    label_color=COLOR_MUTED,
+) -> np.ndarray:
+    gray = normalize_pixels(np.asarray(pixels, dtype=np.float32), lo, hi, invert=invert)
+    render_w = canvas_width if natural_width is None else int(natural_width)
+    render_w = int(np.clip(render_w, 1, canvas_width))
+
+    strip = np.repeat(gray[np.newaxis, :], height, axis=0)
+    strip_bgr = cv2.cvtColor(strip, cv2.COLOR_GRAY2BGR)
+    if strip_bgr.shape[1] != render_w:
+        strip_bgr = cv2.resize(strip_bgr, (render_w, height), interpolation=cv2.INTER_NEAREST)
+
+    canvas = np.zeros((height, canvas_width, 3), dtype=np.uint8)
+    x0 = max(0, (canvas_width - render_w) // 2)
+    canvas[:, x0:x0 + render_w] = strip_bgr[:, :render_w]
+
+    if label:
+        lx = x0 + 4 if natural_width is not None else 4
+        _put(canvas, label, lx, 14, color=label_color, scale=0.4)
+    return canvas
+
 
 def draw_header(
-    packet: FramePacket,
-    det: Optional[BitRecoveryResult],
-    angle_est: Optional["AngleEstimationResult"],
-    n_bits_apriori: int,
-    lo: float, hi: float,
-    width: int, height: int,
-    filter_order: int,
-    threshold_pct: float,
+    packet, det, angle_est, n_bits_apriori,
+    lo, hi, width, height,
+    filter_order, threshold_pct, distort_k,
     has_ground_truth: bool = False,
-    roi_left: int = 0,
-    roi_right: int = 0,
 ) -> np.ndarray:
-    """
-    Справочная текстовая информация.
-
-    При наличии angle_est дополнительно выводится:
-    - средний оценённый угол
-    - circular std по окнам
-    """
     hdr = np.full((height, width, 3), 245, dtype=np.uint8)
-
-    period_err = 0.0
-    if det is not None and det.bit_width_px > 0 and det.measured_bit_period > 0:
-        period_err = (det.measured_bit_period - det.bit_width_px) / det.bit_width_px * 100.0
-
-    lines: list[tuple[str, tuple, float, int]] = []
-
-    roi_clip_str = ""
-    if roi_left > 0 or roi_right > 0:
-        roi_clip_str = f"  roi_clip=[{roi_left}..n-{roi_right}]"
+    lines = []
     lines.append((
-        f"source={packet.source_label}  row={packet.row_index}"
-        f"  range=[{lo:.1f}, {hi:.1f}]{roi_clip_str}",
-        COLOR_MUTED, 0.44, 1
+        f"source={packet.source_label} row={packet.row_index} "
+        f"range=[{lo:.1f},{hi:.1f}] k={distort_k:.5f}",
+        COLOR_MUTED, 0.44, 1,
     ))
 
-    if det is not None:
-        period_str = f"T={det.measured_bit_period:.3f} px ({period_err:+.2f}%)"
+    if det is None:
+        lines.append(("Processing...", COLOR_MUTED, 0.44, 1))
+    else:
+        period_err = 0.0
+        if det.bit_width_px > 0 and det.measured_bit_period > 0:
+            period_err = (det.measured_bit_period - det.bit_width_px) / det.bit_width_px * 100.0
         lines.append((
-            f"N={filter_order}  thr={threshold_pct:.0f}%  "
-            f"roi=[{det.roi_start:.1f} .. {det.roi_end:.1f}]  {period_str}",
-            COLOR_TEXT, 0.44, 1
+            f"N={filter_order} thr={threshold_pct:.0f}% T={det.measured_bit_period:.3f}px ({period_err:+.2f}%)",
+            COLOR_TEXT, 0.44, 1,
         ))
-
+        n_exp, n_got = n_bits_apriori, len(det.recovered_bit_values)
         if has_ground_truth:
-            acc_color = (COLOR_OK if det.accuracy >= 99.0
-                         else COLOR_ERR if det.accuracy < 90.0
-                         else COLOR_MUTED)
+            col = COLOR_OK if det.accuracy >= 99.0 else (COLOR_ERR if det.accuracy < 90.0 else COLOR_MUTED)
             lines.append((
-                f"edges={len(det.detected_edges)}  "
-                f"bits_apriori={n_bits_apriori}  "
-                f"bits_recov={len(det.recovered_bit_values)}  "
-                f"rms={det.rms_edge_error:.3f} px  "
-                f"acc={det.accuracy:.1f}%",
-                acc_color, 0.44, 1
+                f"edges={len(det.detected_edges)} bits_apriori={n_exp} bits_recov={n_got} rms={det.rms_edge_error:.3f}px acc={det.accuracy:.1f}%",
+                col, 0.44, 1,
             ))
         else:
-            n_exp = n_bits_apriori
-            n_got = len(det.recovered_bit_values)
-            count_color = COLOR_OK if n_got == n_exp else COLOR_ERR
+            col = COLOR_OK if n_got == n_exp else COLOR_ERR
             lines.append((
-                f"edges={len(det.detected_edges)}  "
-                f"bits_apriori={n_exp}  "
-                f"bits_recov={n_got}  "
-                f"rms=N/A  acc=N/A",
-                count_color, 0.44, 1
+                f"edges={len(det.detected_edges)} bits_apriori={n_exp} bits_recov={n_got} rms=N/A acc=N/A",
+                col, 0.44, 1,
             ))
-
         if angle_est is None:
-            lines.append((
-                "Angle: N/A",
-                COLOR_MUTED, 0.44, 1
-            ))
+            lines.append(("Angle: N/A", COLOR_MUTED, 0.44, 1))
         elif angle_est.mean_angle_deg is None:
             lines.append((
-                f"Angle: N/A  "
-                f"full_bits={angle_est.visible_bits}  "
-                f"sync={angle_est.matched_windows}/{angle_est.total_windows}",
-                COLOR_MUTED, 0.44, 1
+                f"Angle: N/A full_bits={angle_est.visible_bits} sync={angle_est.matched_windows}/{angle_est.total_windows}",
+                COLOR_MUTED, 0.44, 1,
             ))
         else:
-            std_str = (
-                f"{angle_est.std_angle_deg:.5f}°"
-                if angle_est.std_angle_deg is not None
-                else "N/A"
-            )
-            offset_str = (
-                f"  offset={angle_est.chosen_offset}"
-                if angle_est.chosen_offset is not None
-                else ""
-            )
+            std_s = f"{angle_est.std_angle_deg:.5f}°" if angle_est.std_angle_deg is not None else "N/A"
+            off_s = f" offset={angle_est.chosen_offset}" if angle_est.chosen_offset is not None else ""
             lines.append((
-                f"Angle: {angle_est.mean_angle_deg:.4f}°  "
-                f"std={std_str}  "
-                f"full_bits={angle_est.visible_bits}  "
-                f"sync={angle_est.matched_windows}/{angle_est.total_windows}"
-                f"{offset_str}",
-                COLOR_TEXT, 0.44, 1
+                f"Angle: {angle_est.mean_angle_deg:.4f}° std={std_s} full_bits={angle_est.visible_bits} sync={angle_est.matched_windows}/{angle_est.total_windows}{off_s}",
+                COLOR_TEXT, 0.44, 1,
             ))
-
         lines.append((
             f"Recov: {''.join(str(int(b)) for b in det.recovered_bit_values)}",
-            COLOR_RECOV, 0.42, 1
+            COLOR_REC, 0.42, 1,
         ))
-    else:
-        lines.append(("Processing...", COLOR_MUTED, 0.44, 1))
 
     y = 18
     for text, color, scale, thick in lines:
-        _put(hdr, text, 8, y, color=color, scale=scale, thickness=thick)
+        _put(hdr, text, 8, y, color=color, scale=scale, thick=thick)
         y += 18
-
     cv2.line(hdr, (0, height - 1), (width - 1, height - 1), COLOR_EDGE, 1)
     return hdr
-
-
-def draw_strip_2d(pixels: np.ndarray, lo: float, hi: float,
-                  width: int, height: int, invert: bool = False) -> np.ndarray:
-    """
-    Псевдо-2D grayscale-полоса — горизонтальная визуализация ПЗС-сигнала.
-    Аналог верхней панели demo_opencv и ax_2d в visualizer.py.
-    """
-    gray = normalize_pixels(pixels, lo, hi, invert=invert)
-    strip = np.repeat(gray[np.newaxis, :], height, axis=0)
-    strip_bgr = cv2.cvtColor(strip, cv2.COLOR_GRAY2BGR)
-    if strip_bgr.shape[1] != width:
-        strip_bgr = cv2.resize(strip_bgr, (width, height), interpolation=cv2.INTER_NEAREST)
-    return strip_bgr
 
 
 def draw_bit_panel(
     pixels: np.ndarray,
     det: Optional[BitRecoveryResult],
-    width: int, height: int,
+    width: int,
+    height: int,
     n_pixels: int,
-    lo: float, hi: float,
-    minmax_window: int
+    lo: float,
+    hi: float,
+    minmax_window: int,
 ) -> np.ndarray:
-    """
-    Нижняя панель: нормализованный сигнал + разметка только ПОЛНЫХ восстановленных битов.
-
-    Частично видимые биты у границ ROI не рисуются.
-    """
     canvas = np.full((height, width, 3), 255, dtype=np.uint8)
-    xmap   = _x_mapper(n_pixels, width, left_pad=0)
-
-    top_pad  = 4
-    bot_pad  = 4
-    plot_h   = height - top_pad - bot_pad
-    sig_top  = top_pad + int(plot_h * 0.05)
-    sig_bot  = top_pad + int(plot_h * 0.55)
+    xmap = _x_mapper(n_pixels, width)
+    top_pad, bot_pad = 4, 4
+    plot_h = height - top_pad - bot_pad
+    sig_top = top_pad + int(plot_h * 0.05)
+    sig_bot = top_pad + int(plot_h * 0.55)
     bit_y_hi = top_pad + int(plot_h * 0.65)
     bit_y_lo = top_pad + int(plot_h * 0.90)
 
-    # --- Сигнал ---
     norm = np.clip((pixels - lo) / max(hi - lo, 1e-6), 0.0, 1.0)
-    pts = []
-    for i, v in enumerate(norm):
-        y = int(round(sig_bot - v * (sig_bot - sig_top)))
-        pts.append((xmap(i), y))
-    cv2.polylines(
-        canvas,
-        [np.array(pts, dtype=np.int32)],
-        False,
-        (80, 80, 80),
-        1,
-        cv2.LINE_AA,
-    )
+    pts = [(xmap(i), int(round(sig_bot - v * (sig_bot - sig_top)))) for i, v in enumerate(norm)]
+    if pts:
+        cv2.polylines(canvas, [np.array(pts, np.int32)], False, (80, 80, 80), 1, cv2.LINE_AA)
 
     local_norm = apply_minmax_normalization(norm, minmax_window)
-    pts = []
-    for i, v in enumerate(local_norm):
-        y = int(round(sig_bot - v * (sig_bot - sig_top)))
-        pts.append((xmap(i), y))
-    cv2.polylines(
-        canvas,
-        [np.array(pts, dtype=np.int32)],
-        False,
-        (150, 20, 20),
-        1,
-        cv2.LINE_AA,
-    )
+    pts2 = [(xmap(i), int(round(sig_bot - v * (sig_bot - sig_top)))) for i, v in enumerate(local_norm)]
+    if pts2:
+        cv2.polylines(canvas, [np.array(pts2, np.int32)], False, (150, 20, 20), 1, cv2.LINE_AA)
 
     if det is None:
+        cv2.rectangle(canvas, (0, top_pad), (width - 1, height - bot_pad), COLOR_EDGE, 1)
+        _put(canvas, "Signal (undistorted) + full-bit recovery", 4, top_pad + 12, COLOR_MUTED, 0.38)
         return canvas
 
-    # --- ROI ---
-    for roi_x in (det.roi_start, det.roi_end):
-        xx = xmap(roi_x)
-        cv2.line(
-            canvas,
-            (xx, top_pad),
-            (xx, height - bot_pad),
-            COLOR_ROI,
-            1,
-            cv2.LINE_AA,
-        )
-
-    # --- Полные восстановленные биты ---
-    full_cells = []
-    cell_boundaries = []
-
+    full_cells, boundaries = [], []
     for rb in det.recovered_bits:
         if rb.segment_idx < 0 or rb.segment_idx >= len(det.bit_segments):
             continue
-
         seg = det.bit_segments[rb.segment_idx]
         if seg.measured_period <= 1e-12:
             continue
-
-        bit_start = float(rb.position)
-        bit_end = float(bit_start + seg.measured_period)
-
+        bs = float(rb.position)
+        be = bs + seg.measured_period
         eps = max(1e-9, 1e-6 * seg.measured_period)
-        is_full_bit_inside = (
-            bit_start >= float(seg.start_pos) - eps and
-            bit_end <= float(seg.end_pos) + eps
-        )
+        if bs >= seg.start_pos - eps and be <= seg.end_pos + eps:
+            full_cells.append((bs, be, int(rb.value)))
+            boundaries += [bs, be]
 
-        if not is_full_bit_inside:
-            continue
-
-        full_cells.append((bit_start, bit_end, int(rb.value)))
-        cell_boundaries.append(bit_start)
-        cell_boundaries.append(bit_end)
-
-    # --- Границы полных битовых ячеек ---
-    if cell_boundaries:
+    if boundaries:
         uniq = []
-        for b in sorted(cell_boundaries):
+        for b in sorted(boundaries):
             if not uniq or abs(b - uniq[-1]) > 1e-6:
                 uniq.append(b)
-
         for bx in uniq:
-            xx = xmap(bx)
-            cv2.line(
-                canvas,
-                (xx, bit_y_hi - 6),
-                (xx, height - bot_pad),
-                COLOR_GRID,
-                1,
-                cv2.LINE_AA,
-            )
+            cv2.line(canvas, (xmap(bx), bit_y_hi - 6), (xmap(bx), height - bot_pad), COLOR_GRID, 1, cv2.LINE_AA)
 
-    # --- Отрисовка только полных битов ---
-    for bit_start, bit_end, bit_value in full_cells:
-        x1 = xmap(bit_start)
-        x2 = xmap(bit_end)
-        y_seg = bit_y_hi if bit_value else bit_y_lo
-
-        cv2.line(canvas, (x1, y_seg), (x2, y_seg), COLOR_RECOV, 2, cv2.LINE_AA)
-
+    for bs, be, bv in full_cells:
+        x1, x2 = xmap(bs), xmap(be)
+        yy = bit_y_hi if bv else bit_y_lo
+        cv2.line(canvas, (x1, yy), (x2, yy), COLOR_REC, 2, cv2.LINE_AA)
         if abs(x2 - x1) >= 8:
-            mid_x = (x1 + x2) // 2 - 4
-            _put(
-                canvas,
-                str(bit_value),
-                mid_x,
-                y_seg - 3,
-                color=COLOR_RECOV,
-                scale=0.38,
-                thickness=1,
-            )
+            _put(canvas, str(bv), (x1 + x2) // 2 - 4, yy - 3, color=COLOR_REC, scale=0.38)
 
-    # --- Фронты ---
     for edge in det.detected_edges:
         xx = xmap(edge.position)
-        color = COLOR_RISING if edge.d1_value > 0 else COLOR_FALL
-        cv2.line(
-            canvas,
-            (xx, top_pad),
-            (xx, height - bot_pad),
-            color,
-            1,
-            cv2.LINE_AA,
-        )
-
+        col = COLOR_RISE if edge.d1_value > 0 else COLOR_FALL
+        cv2.line(canvas, (xx, top_pad), (xx, height - bot_pad), col, 1, cv2.LINE_AA)
         idx = int(round(edge.position))
         if 0 <= idx < len(norm):
             cy = int(round(sig_bot - norm[idx] * (sig_bot - sig_top)))
-            cv2.circle(canvas, (xx, cy), 3, color, -1, cv2.LINE_AA)
+            cv2.circle(canvas, (xx, cy), 3, col, -1, cv2.LINE_AA)
 
-    cv2.rectangle(
-        canvas,
-        (0, top_pad),
-        (width - 1, height - bot_pad),
-        COLOR_EDGE,
-        1,
-    )
-    _put(canvas, "Signal + full-bit recovery", 4, top_pad + 12, COLOR_MUTED, 0.38)
+    cv2.rectangle(canvas, (0, top_pad), (width - 1, height - bot_pad), COLOR_EDGE, 1)
+    _put(canvas, "Signal (undistorted) + full-bit recovery", 4, top_pad + 12, COLOR_MUTED, 0.38)
     return canvas
 
 
-
-# ============================================================
-# ROI-clipping wrapper
-# ============================================================
-
-def _detect_with_fixed_roi(
+def _detect_full_width(
     pixels: np.ndarray,
     true_bits: np.ndarray,
     true_edges: np.ndarray,
-    distort_coeff: float,
-    br_config: "BRConfig",
-    roi_left: int,
-    roi_right: int,
-) -> "BitRecoveryResult":
-    """
-    Запускает детектор на ПОЛНОМ сигнале, но с фиксированным ROI
-    в координатах исходного сигнала.
+    br_config: BRConfig,
+) -> BitRecoveryResult:
+    """Detect edges and recover bits over the full width of the undistorted signal."""
+    er = detect_edges(np.asarray(pixels, dtype=np.float64), br_config)
+    return recover_bits(er, true_bits, true_edges)
 
-    Это важно для текущей реализации blais_rioux:
-    крайние сегменты около ROI восстанавливаются корректно только если
-    roi_start/roi_end переданы явно.
-    """
-    from dataclasses import replace as _replace
-
-    n = len(pixels)
-    l = max(0, roi_left)
-    r = max(0, roi_right)
-
-    if l + r >= n:
-        raise ValueError(
-            f"roi_left={l} + roi_right={r} >= n_pixels={n}: ROI пустой"
-        )
-
-    roi_start = float(l)
-    roi_end = float(n - 1 - r)
-
-    signal = pixels.astype(np.float64)
-
-    br_config_roi = _replace(
-        br_config,
-        roi_start=roi_start,
-        roi_end=roi_end,
-    )
-
-    det = detect_edges_and_recover_bits(
-        signal,
-        true_bits,
-        true_edges,
-        distort_coeff,
-        br_config_roi,
-    )
-
-    return det
-
-
-# ============================================================
-# Расчет угла
-# ============================================================
 
 def _estimate_angle_if_possible(
-    det: Optional["EdgeDetectionResult"],
-    code_angle_map: Optional[dict[str, int]],
+    det: Optional[BitRecoveryResult],
+    code_angle_map: Optional[dict],
     n_pixels: int,
-) -> Optional["AngleEstimationResult"]:
-    """
-    Считает абсолютный угол диска по полным битам внутри ROI.
-
-    Все параметры углового кода берутся из постоянных настроек в коде:
-    - FULL_DISK_CODE_SEQUENCE
-    - TOTAL_CODE_BITS_ON_DISK
-    - CODEWORD_LENGTH_BITS
-    - ANGLE_PERIOD_DEG
-    - SENSOR_CENTER_PIXEL
-    - ANGLE_PER_SENSOR_PIXEL_DEG / ANGLE_AXIS_SIGN
-    """
-    if not ENABLE_ANGLE_ESTIMATION:
+) -> Optional[AngleEstimationResult]:
+    if not ENABLE_ANGLE_ESTIMATION or det is None or code_angle_map is None:
         return None
-
-    if det is None:
+    if CODEWORD_LENGTH_BITS <= 0 or TOTAL_CODE_BITS_ON_DISK <= 0:
         return None
-
-    if code_angle_map is None:
-        return None
-
-    if CODEWORD_LENGTH_BITS <= 0:
-        return None
-
-    if TOTAL_CODE_BITS_ON_DISK <= 0:
-        return None
-
-    sensor_center_px = (
-        float(SENSOR_CENTER_PIXEL)
-        if SENSOR_CENTER_PIXEL is not None
-        else 0.5 * (n_pixels - 1)
-    )
-
+    sc_px = float(SENSOR_CENTER_PIXEL) if SENSOR_CENTER_PIXEL is not None else 0.5 * (n_pixels - 1)
     if ANGLE_PER_SENSOR_PIXEL_DEG is not None:
-        angle_per_px_deg = float(ANGLE_PER_SENSOR_PIXEL_DEG)
+        a_per_px = float(ANGLE_PER_SENSOR_PIXEL_DEG)
     else:
-        bit_period_px = float(det.bit_width_px)
-
-        if bit_period_px <= 1e-12:
+        if det.bit_width_px <= 1e-12:
             return None
-
-        angle_per_px_deg = (
-            float(ANGLE_AXIS_SIGN)
-            * float(ANGLE_PERIOD_DEG)
-            / (float(TOTAL_CODE_BITS_ON_DISK) * bit_period_px)
-        )
-
+        a_per_px = float(ANGLE_AXIS_SIGN) * float(ANGLE_PERIOD_DEG) / (float(TOTAL_CODE_BITS_ON_DISK) * det.bit_width_px)
     return estimate_disk_angle_from_result(
         detection_result=det,
         code_angle_map=code_angle_map,
         codeword_length=CODEWORD_LENGTH_BITS,
         total_code_bits=TOTAL_CODE_BITS_ON_DISK,
-        sensor_center_px=sensor_center_px,
-        angle_per_px_deg=angle_per_px_deg,
+        sensor_center_px=sc_px,
+        angle_per_px_deg=a_per_px,
         angle_period_deg=ANGLE_PERIOD_DEG,
     )
 
-# ============================================================
-# Сборка кадра
-# ============================================================
 
 def compose_frame(
     packet: FramePacket,
     args,
     ranger: AutoRange,
-    det: Optional[EdgeDetectionResult],
-    angle_est: Optional["AngleEstimationResult"],
+    det: Optional[BitRecoveryResult],
+    angle_est: Optional[AngleEstimationResult],
     filter_order: int,
     threshold_pct: float,
+    distort_k: float,
 ) -> np.ndarray:
-    pixels = packet.pixels.astype(np.float32)
-    lo, hi = (ranger.update(pixels)
-               if args.min_val is None or args.max_val is None
-               else (args.min_val, args.max_val))
+    raw_pixels = np.asarray(packet.pixels, dtype=np.float32)
 
-    n_px   = len(pixels)
-    width  = max(512, n_px * args.pixel_width)
-    header_h = args.header_height
-    strip_h  = max(30, args.strip_height)
-    bit_h    = max(80, args.window_height - header_h - strip_h)
+    if args.min_val is not None and args.max_val is not None:
+        lo, hi = args.min_val, args.max_val
+    else:
+        lo, hi = ranger.update(raw_pixels)
 
-    has_gt = (packet.source_label == "simulation")
-    hdr    = draw_header(
-        packet,
-        det,
-        angle_est,
-        args.n_bits,
-        lo,
-        hi,
-        width,
-        header_h,
-        filter_order,
-        threshold_pct,
-        has_ground_truth=has_gt,
-        roi_left=args.roi_left,
-        roi_right=args.roi_right,
+    if det is not None:
+        vis_undist = np.asarray(det.undistorted_signal, dtype=np.float32)
+    elif abs(distort_k) > 1e-15:
+        _, vis_undist, _ = restore_signal_1d(
+            raw_pixels.astype(np.float64),
+            distort_k,
+            output_step_px=1.0,
+            clip_to_adc=True,
+            as_uint16=False,
+        )
+        vis_undist = np.asarray(vis_undist, dtype=np.float32)
+    else:
+        vis_undist = raw_pixels.copy()
+
+    n_raw = len(raw_pixels)
+    n_undist = len(vis_undist)
+    hdr_h = args.header_height
+    str_h = max(30, args.strip_height)
+    bit_h = max(80, args.window_height - hdr_h - 2 * str_h - 4)
+    has_gt = packet.source_label == "simulation"
+    # Ширина холста определяется undistorted сигналом
+    width = max(512, n_undist * args.pixel_width)
+    # ORIGINAL отображается в своём натуральном масштабе пикселя
+    raw_natural_w = n_raw * args.pixel_width  # ← было: round(width * n_raw / n_undist)
+
+    hdr = draw_header(
+        packet, det, angle_est, args.n_bits, lo, hi,
+        width, hdr_h, filter_order, threshold_pct, distort_k,
+        has_ground_truth=has_gt
     )
-    strip  = draw_strip_2d(pixels, lo, hi, width, strip_h, invert=args.invert)
-    bp     = draw_bit_panel(pixels, det, width, bit_h, n_px, lo, hi, args.minmax_window)
 
-    xmap = _x_mapper(n_px, width)
-    for clip_px, panel in ((args.roi_left, strip), (args.roi_left, bp),
-                            (n_px - 1 - args.roi_right, strip), (n_px - 1 - args.roi_right, bp)):
-        if clip_px <= 0 and panel is strip and args.roi_left == 0:
-            continue
-        if clip_px >= n_px - 1 and args.roi_right == 0:
-            continue
-        xx = xmap(clip_px)
-        h  = panel.shape[0]
-        cv2.line(panel, (xx, 0), (xx, h - 1), (0, 180, 80), 2, cv2.LINE_AA)
+    # При вызовах draw_strip_2d оба получают свой natural_width:
+    s_raw = draw_strip_2d(
+        raw_pixels, lo, hi, width, str_h,
+        invert=args.invert,
+        natural_width=raw_natural_w,  # пиксели ORIGINAL в истинном масштабе
+        label="ORIGINAL", label_color=COLOR_MUTED,
+    )
+    s_undist = draw_strip_2d(
+        vis_undist, lo, hi, width, str_h,
+        invert=args.invert,
+        natural_width=width,  # undistorted занимает весь холст
+        label=f"CORRECTED (k={distort_k:.4f})", label_color=COLOR_UNDIST_LABEL,
+    )
+    bp = draw_bit_panel(
+        vis_undist,
+        det,
+        width,
+        bit_h,
+        n_pixels=n_undist,
+        lo=lo,
+        hi=hi,
+        minmax_window=args.minmax_window,
+    )
 
-    return np.vstack([hdr, strip, bp])
+    div = np.full((2, width, 3), 180, dtype=np.uint8)
+    return np.vstack([hdr, s_raw, div, s_undist, div, bp])
 
-
-# ============================================================
-# Источники данных
-# ============================================================
 
 def matrix_packets(args):
-    """Генератор пакетов из serial CSV (формат: row_index,px0,px1,...,pxN-1)."""
     ser = _serial_module.Serial(args.port, args.baud, timeout=1)
     time.sleep(1.0)
     try:
         while True:
             line = ser.readline()
-            packet = _parse_csv(line.decode("utf-8", errors="ignore"))
-            if packet is not None:
-                yield packet
+            pkt = _parse_csv(line.decode("utf-8", errors="ignore"))
+            if pkt is not None:
+                yield pkt
     finally:
         ser.close()
 
 
 def _parse_csv(text: str) -> Optional[FramePacket]:
-    """Разбор строки CSV: row_index, px0, px1, ..."""
     try:
         parts = text.strip().split(",")
         if len(parts) < 2:
             return None
-        row_idx = int(parts[0])
-        pixels  = np.array([float(x) for x in parts[1:]], dtype=np.float32)
-        return FramePacket(row_index=row_idx, pixels=pixels, source_label="matrix")
+        return FramePacket(
+            row_index=int(parts[0]),
+            pixels=np.array(parts[1:], dtype=np.float32),
+            source_label="matrix",
+        )
     except Exception:
         return None
 
 
-# ============================================================
-# CLI
-# ============================================================
-
 def build_argparser() -> argparse.ArgumentParser:
-    p = argparse.ArgumentParser(
-        description=(
-            "OpenCV-визуализация алгоритма Blais-Rioux Edge Detector.\n"
-            "Аналог demo_opencv.py из EncoderModel, адаптированный для EncoderDecoder."
-        ),
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-    )
+    p = argparse.ArgumentParser(description="OpenCV Blais-Rioux Edge Detector with distortion correction.")
+    src = p.add_argument_group("Data source")
+    src.add_argument("--source", choices=["sim", "matrix"], default="sim")
+    src.add_argument("--port", default=None)
+    src.add_argument("--baud", type=int, default=115200)
 
-    # ---- Источник ----
-    src = p.add_argument_group("Источник данных")
-    src.add_argument(
-        "--source", choices=["sim", "matrix"], default="sim",
-        help="Источник: sim=симуляция, matrix=serial ПЗС-матрица",
-    )
-    src.add_argument("--port",  default=None,   help="COM-порт (только --source=matrix)")
-    src.add_argument("--baud",  type=int, default=115200, help="Скорость serial (default: 115200)")
+    sim = p.add_argument_group("Simulation")
+    sim.add_argument("--n-bits", type=int, default=24)
+    sim.add_argument("--bit-width", type=float, default=6)
+    sim.add_argument("--blur", type=float, default=0.5)
+    sim.add_argument("--noise", type=float, default=60.0)
+    sim.add_argument("--vignette", type=float, default=0.25)
+    sim.add_argument("--n-pixels", type=int, default=128)
+    sim.add_argument("--seed", type=int, default=7)
+    sim.add_argument("--animate", action="store_true")
+    sim.add_argument("--fps", type=float, default=2.0)
 
-    # ---- Параметры симуляции ----
-    sim = p.add_argument_group("Параметры симуляции (--source sim)")
-    sim.add_argument("--n-bits",    type=int,   default=24,    help="Количество бит (default: 24)")
-    sim.add_argument("--bit-width", type=float, default=6,   help="Ширина бита, px (default: 6)")
-    sim.add_argument("--blur",      type=float, default=0.5,   help="Размытие оптики σ (default: 0.5)")
-    sim.add_argument("--noise",     type=float, default=60.0,  help="Шум АЦП ADU (default: 60)")
-    sim.add_argument("--vignette",  type=float, default=0.25,  help="Виньетирование 0..1 (default: 0.25)")
-    sim.add_argument("--distort",   type=float, default=0.0,   help="Дисторсия (default: 0.0)")
-    sim.add_argument("--n-pixels",  type=int,   default=128,   help="Пикселей ПЗС (default: 128)")
-    sim.add_argument("--seed",      type=int,   default=7,     help="Random seed (default: 7)")
-    sim.add_argument(
-        "--animate", action="store_true",
-        help="Обновлять seed каждый кадр (анимированная демонстрация)",
-    )
-    sim.add_argument("--fps", type=float, default=2.0, help="Частота смены кадров для --animate (default: 2)")
+    br = p.add_argument_group("Blais-Rioux algorithm")
+    br.add_argument("--filter-order", type=int, choices=[2, 4], default=2)
+    br.add_argument("--threshold", type=float, default=15.0)
+    br.add_argument("--min-dist", type=float, default=30.0)
+    br.add_argument("--smoothing", type=float, default=0.2)
+    br.add_argument("--minmax-window", type=int, default=50)
 
-    # ---- Параметры алгоритма Blais-Rioux ----
-    br = p.add_argument_group("Алгоритм Blais-Rioux")
-    br.add_argument(
-        "--filter-order", type=int, choices=[2, 4], default=2,
-        help="Порядок КИХ-фильтра N=2 или N=4 (default: 2)",
-    )
-    br.add_argument(
-        "--threshold", type=float, default=15.0,
-        help="Порог |D1| в %% от максимума (default: 15)",
-    )
-    br.add_argument(
-        "--min-dist", type=float, default=30.0,
-        help="Мин. расстояние между фронтами в %% от T (default: 30)",
-    )
-    br.add_argument(
-        "--smoothing", type=float, default=0.2,
-        help="Сглаживание σ перед D1 (default: 0.2)",
-    )
-    br.add_argument(
-        "--minmax-window", type=int, default=50,
-        help="Окно min-max нормировки, px (default: 50)",
-    )
+    cor = p.add_argument_group("Distortion correction")
+    cor.add_argument("--distort-k", type=float, default=None)
 
-
-    # ---- Параметры отображения ----
-    disp = p.add_argument_group("Параметры отображения")
-    disp.add_argument("--roi-left",      type=int,   default=0,   help="Обрезка сигнала слева, пикселей (default: 0)")
-    disp.add_argument("--roi-right",     type=int,   default=0,   help="Обрезка сигнала справа, пикселей (default: 0)")
-    disp.add_argument("--pixel-width",   type=int,   default=5,   help="Ширина одного пикселя ПЗС на экране (default: 5)")
-    disp.add_argument("--header-height", type=int, default=110,   help="Высота заголовка, px (default: 110)")
-    disp.add_argument("--strip-height",  type=int,   default=40,  help="Высота 2D-полосы, px (default: 40)")
-    disp.add_argument("--window-height", type=int,   default=500, help="Общая высота окна (default: 500)")
-    disp.add_argument("--invert",        action="store_true",     help="Инвертировать grayscale")
-    disp.add_argument("--min",           dest="min_val", type=float, default=None, help="Фиксированный минимум")
-    disp.add_argument("--max",           dest="max_val", type=float, default=None, help="Фиксированный максимум")
-    disp.add_argument("--save",          default=None, help="Сохранить кадр в PNG и выйти")
-    disp.add_argument("--no-window",     action="store_true",     help="Не показывать окно (только --save)")
-
+    disp = p.add_argument_group("Display")
+    disp.add_argument("--pixel-width", type=int, default=5)
+    disp.add_argument("--header-height", type=int, default=120)
+    disp.add_argument("--strip-height", type=int, default=40)
+    disp.add_argument("--window-height", type=int, default=600)
+    disp.add_argument("--invert", action="store_true")
+    disp.add_argument("--min", dest="min_val", type=float, default=None)
+    disp.add_argument("--max", dest="max_val", type=float, default=None)
+    disp.add_argument("--save", default=None)
+    disp.add_argument("--no-window", action="store_true")
     return p
 
 
-# ============================================================
-# Главный цикл
-# ============================================================
-
 def run(args) -> None:
+    distort_k = args.distort_k if args.distort_k is not None else DISTORT_K
     br_config = BRConfig(
         filter_order=args.filter_order,
         peak_threshold_rel=args.threshold / 100.0,
@@ -785,99 +485,53 @@ def run(args) -> None:
         bit_width_px=args.bit_width,
         smoothing_sigma=args.smoothing,
         minmax_window_px=args.minmax_window,
+        distort_coeff=distort_k,
     )
 
-    angle_code_map: Optional[dict[str, int]] = None
-
+    angle_code_map: Optional[dict] = None
     if ENABLE_ANGLE_ESTIMATION:
-        try:
-            if not FULL_DISK_CODE_SEQUENCE:
-                raise ValueError("FULL_DISK_CODE_SEQUENCE is empty")
-
-            angle_code_map = build_code_angle_map(
-                code_sequence=FULL_DISK_CODE_SEQUENCE,
-                total_code_bits=TOTAL_CODE_BITS_ON_DISK,
-                codeword_length=CODEWORD_LENGTH_BITS,
-            )
-
-            print(
-                "[INFO] Кодовая карта построена: "
-                f"N={TOTAL_CODE_BITS_ON_DISK}, "
-                f"m={CODEWORD_LENGTH_BITS}, "
-                f"words={len(angle_code_map)}"
-            )
-
-        except Exception as e:
-            print(f"[ERROR] Невозможно построить кодовую карту: {e}",
-                  file=sys.stderr)
-            sys.exit(1)
+        angle_code_map = build_code_angle_map(
+            code_sequence=FULL_DISK_CODE_SEQUENCE,
+            total_code_bits=TOTAL_CODE_BITS_ON_DISK,
+            codeword_length=CODEWORD_LENGTH_BITS,
+        )
 
     ranger = AutoRange()
-    win    = "Blais-Rioux Edge Detector"
+    win = "Blais-Rioux Edge Detector"
 
-    # ---------- source=matrix: поточный режим ----------
     if args.source == "matrix":
         if args.port is None:
-            print("[ERROR] --port не задан для --source=matrix", file=sys.stderr)
+            print("[ERROR] --port required for --source=matrix", file=sys.stderr)
             sys.exit(1)
         if not args.no_window:
             cv2.namedWindow(win, cv2.WINDOW_NORMAL)
-
         for packet in matrix_packets(args):
-            pixels = packet.pixels
-            true_bits  = np.zeros(args.n_bits, dtype=np.int32)
-            true_edges = np.array([])
-
-            angle_est = None
+            det = angle_est = None
             try:
-                det = _detect_with_fixed_roi(
-                    pixels,
-                    true_bits, true_edges,
-                    0.0,
+                det = _detect_full_width(
+                    packet.pixels,
+                    np.zeros(args.n_bits, dtype=np.int32),
+                    np.array([]),
                     br_config,
-                    roi_left=args.roi_left,
-                    roi_right=args.roi_right,
                 )
-                angle_est = _estimate_angle_if_possible(
-                    det,
-                    angle_code_map,
-                    len(pixels),
-                )
+                angle_est = _estimate_angle_if_possible(det, angle_code_map, len(packet.pixels))
             except Exception as e:
-                print(f"[WARN] Ошибка обработки: {e}")
-                det = None
-                angle_est = None
-
-            frame = compose_frame(
-                packet,
-                args,
-                ranger,
-                det,
-                angle_est,
-                args.filter_order,
-                args.threshold,
-            )
-
+                print(f"[WARN] {e}")
+            frame = compose_frame(packet, args, ranger, det, angle_est, args.filter_order, args.threshold, distort_k)
             if args.save:
                 cv2.imwrite(args.save, frame)
-                print(f"Сохранено: {args.save}")
                 break
-
             if not args.no_window:
                 cv2.imshow(win, frame)
-                key = cv2.waitKey(1) & 0xFF
-                if key in (ord("q"), 27):
+                if cv2.waitKey(1) & 0xFF in (ord("q"), 27):
                     break
-
         if not args.no_window:
             cv2.destroyAllWindows()
         return
 
-    # ---------- source=sim ----------
     seed = args.seed
     if not args.no_window:
         cv2.namedWindow(win, cv2.WINDOW_NORMAL)
-
     frame_interval = max(1, int(1000 / max(args.fps, 0.1))) if args.animate else 0
 
     while True:
@@ -887,71 +541,42 @@ def run(args) -> None:
             sigma_blur_px=args.blur,
             noise_sigma_adu=args.noise,
             vignette_strength=args.vignette,
-            distort_coeff=args.distort,
+            distort_coeff=distort_k,
             n_pixels=args.n_pixels,
             seed=seed,
         )
         sim_result = simulate_ccd(sim_cfg)
-
         packet = FramePacket(
             row_index=seed if args.animate else 0,
             pixels=sim_result.adc_signal.astype(np.float32),
             source_label="simulation",
         )
-
-        angle_est = None
+        det = angle_est = None
         try:
-            det = _detect_with_fixed_roi(
+            det = _detect_full_width(
                 sim_result.adc_signal.astype(np.float64),
                 sim_result.bits,
                 sim_result.true_edges,
-                sim_cfg.distort_coeff,
                 br_config,
-                roi_left=args.roi_left,
-                roi_right=args.roi_right,
             )
-            angle_est = _estimate_angle_if_possible(
-                det,
-                angle_code_map,
-                len(sim_result.adc_signal),
-            )
+            angle_est = _estimate_angle_if_possible(det, angle_code_map, len(sim_result.adc_signal))
         except Exception as e:
-            print(f"[WARN] Ошибка детектора: {e}")
-            det = None
-            angle_est = None
+            print(f"[WARN] Detector error: {e}")
 
-        frame = compose_frame(
-            packet,
-            args,
-            ranger,
-            det,
-            angle_est,
-            args.filter_order,
-            args.threshold,
-        )
-
+        frame = compose_frame(packet, args, ranger, det, angle_est, args.filter_order, args.threshold, distort_k)
         if args.save:
             cv2.imwrite(args.save, frame)
-            print(f"Сохранено: {args.save}")
             break
-
         if args.no_window:
             break
-
         cv2.imshow(win, frame)
-
-        wait = frame_interval if args.animate else 0
-        key = cv2.waitKey(wait) & 0xFF
+        key = cv2.waitKey(frame_interval if args.animate else 0) & 0xFF
         if key in (ord("q"), 27):
             break
         if key == ord("r"):
-            seed = (seed + 1) if args.animate else seed
             ranger = AutoRange()
-
         if args.animate:
             seed += 1
-        else:
-            pass
 
     if not args.no_window:
         cv2.destroyAllWindows()
@@ -959,7 +584,7 @@ def run(args) -> None:
 
 def main() -> None:
     parser = build_argparser()
-    args   = parser.parse_args()
+    args = parser.parse_args()
     run(args)
 
 

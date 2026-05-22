@@ -46,15 +46,11 @@ def distort_division_1d(x_u_norm, k: float) -> np.ndarray:
 
 
 def undistort_division_1d(x_d_norm, k: float) -> np.ndarray:
-    """Inverse model: x_u = 2·x_d / (1 + sqrt(1 − 4·k·x_d²))."""
-    x_d = np.asarray(x_d_norm, dtype=np.float64)
+    x_d_norm = np.asarray(x_d_norm, dtype=np.float64)
     if abs(k) < 1e-15:
-        return x_d.copy()
-    disc = 1.0 - 4.0 * k * x_d ** 2
-    if np.any(disc < 0):
-        raise ValueError("Invalid k: discriminant 1 − 4·k·x_d² < 0")
-    return 2.0 * x_d / (1.0 + np.sqrt(disc))
-
+        return x_d_norm.copy()
+    disc = np.clip(1.0 - 4.0 * k * x_d_norm ** 2, 0.0, None)
+    return 2.0 * x_d_norm / (1.0 + np.sqrt(disc))
 
 # ---------------------------------------------------------------------------
 # Undistorted output grid
@@ -93,26 +89,53 @@ def restore_signal_1d(
     clip_to_adc: bool = True,
     as_uint16: bool = False,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """Remove distortion from a 1-D CCD signal.
+    """
+    Исправление дисторсии 1-D сигнала.
 
-    Returns
-    -------
-    x_u_px   : output pixel positions (undistorted frame)
-    restored : interpolated signal values
-    x_d_px   : corresponding source positions (distorted frame)
+    Алгоритм (геометрически корректный):
+    1) есть исходная равномерная сетка x_d_px = 0..n-1 (искажённый сенсор);
+    2) считаем x_u_px = undistort(x_d_px) — неравномерные положения тех же точек
+       в «идеальном» (недисторсированном) пространстве;
+    3) задаём НОВУЮ равномерную сетку x_u_new_px с тем же шагом (output_step_px),
+       покрывающую [min(x_u_px), max(x_u_px)];
+    4) интерполируем исходный сигнал по x_u_px → значения на x_u_new_px.
+
+    Возвращаем:
+        x_u_new_px : равномерная сетка в исправленном пространстве (размер m)
+        restored   : значения на этой сетке (размер m)
+        x_u_px     : исходная неравномерная сетка позиций для каждого исходного samples
     """
     signal = np.asarray(signal, dtype=np.float64)
     n = len(signal)
     if n < 2:
         raise ValueError("signal length must be >= 2")
-    x_u_norm, x_u_px = build_undistorted_grid(n, k, output_step_px)
-    x_d_px = norm_to_pixel(distort_division_1d(x_u_norm, k), n)
-    restored = np.interp(x_d_px, np.arange(n, dtype=np.float64), signal)
+
+    # 1. Исходная равномерная сетка (искажённый сенсор)
+    x_d_px = np.arange(n, dtype=np.float64)
+    x_d_norm = pixel_to_norm(x_d_px, n)
+
+    # 2. Обратное преобразование: координаты в недисторсированном пространстве
+    x_u_norm = undistort_division_1d(x_d_norm, k)
+    x_u_px = norm_to_pixel(x_u_norm, n)  # НЕравномерная сетка
+
+    # 3. Новая равномерная сетка в исправленном пространстве
+    if output_step_px <= 0:
+        raise ValueError("output_step_px must be > 0")
+    x_min = float(x_u_px.min())
+    x_max = float(x_u_px.max())
+    n_samples = int(np.floor((x_max - x_min) / output_step_px)) + 1
+    x_u_new_px = (x_min + np.arange(n_samples, dtype=np.float64) * output_step_px)
+
+    # 4. Интерполяция сигнала по x_u_px → x_u_new_px
+    #    Важно: интерполируем по x_u_px, а не по x_d.
+    restored = np.interp(x_u_new_px, x_u_px, signal)
+
     if clip_to_adc:
         restored = np.clip(restored, 0, 4095)
     if as_uint16:
         restored = np.clip(np.rint(restored), 0, 4095).astype(np.uint16)
-    return x_u_px, restored, x_d_px
+
+    return x_u_new_px, restored, x_u_px
 
 
 # ---------------------------------------------------------------------------
