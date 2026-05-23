@@ -131,10 +131,16 @@ def run(args: argparse.Namespace) -> None:
             except Exception as exc:
                 print(f"[WARN] detect: {exc}", file=sys.stderr)
 
+            # Передаём длину undistorted-сигнала — идентично demo_opencv_br:
+            #   angle_est = _estimate_angle_if_possible(det, ..., len(packet.pixels))
+            # но внутри функции sensor_center_px и sensor_width_px считаются
+            # от len(det.edge_result.undistorted_signal), поэтому n_pixels
+            # должен соответствовать raw пикселям (как в demo_opencv_br).
+            n_pixels = len(pixels)
             angle_est = _estimate_angle_if_possible(
                 det=det,
                 code_sequence=FULL_DISK_CODE_SEQUENCE,
-                n_pixels=len(pixels),
+                n_pixels=n_pixels,
             )
 
             if angle_est is None or angle_est.mean_angle_deg is None:
