@@ -293,22 +293,28 @@ def _detect_full_width(
 
 def _estimate_angle_if_possible(
     det: Optional[BitRecoveryResult],
-    code_sequence: str,
-    n_pixels: int,
 ) -> Optional[AngleEstimationResult]:
     if not ENABLE_ANGLE_ESTIMATION or det is None:
         return None
     if CODEWORD_LENGTH_BITS <= 0 or TOTAL_CODE_BITS_ON_DISK <= 0:
         return None
-    sc_px = float(SENSOR_CENTER_PIXEL) if SENSOR_CENTER_PIXEL is not None else 0.5 * (n_pixels - 1)
+
+    # sensor_width_px и sensor_center_px — оба в координатах undistorted сигнала
+    n_undist = len(det.edge_result.undistorted_signal)
+    sensor_width_px = float(n_undist)
+    sensor_center_px = (
+        float(SENSOR_CENTER_PIXEL)
+        if SENSOR_CENTER_PIXEL is not None
+        else 0.5 * (n_undist - 1)
+    )
 
     return estimate_disk_angle_from_result(
         detection_result=det,
-        code_sequence=code_sequence,
+        code_sequence=FULL_DISK_CODE_SEQUENCE,
         codeword_length=CODEWORD_LENGTH_BITS,
-        sensor_width_px=len(det.edge_result.undistorted_signal),
         total_code_bits=TOTAL_CODE_BITS_ON_DISK,
-        sensor_center_px=sc_px,
+        sensor_width_px=sensor_width_px,
+        sensor_center_px=sensor_center_px,
         angle_period_deg=ANGLE_PERIOD_DEG,
     )
 
@@ -484,7 +490,7 @@ def run(args) -> None:
                     np.array([]),
                     br_config,
                 )
-                angle_est = _estimate_angle_if_possible(det, FULL_DISK_CODE_SEQUENCE, len(packet.pixels))
+                angle_est = _estimate_angle_if_possible(det)
             except Exception as e:
                 print(f"[WARN] {e}")
             frame = compose_frame(packet, args, ranger, det, angle_est, args.filter_order, args.threshold, distort_k)
@@ -529,7 +535,7 @@ def run(args) -> None:
                 sim_result.true_edges,
                 br_config,
             )
-            angle_est = _estimate_angle_if_possible(det, FULL_DISK_CODE_SEQUENCE, len(sim_result.adc_signal))
+            angle_est = _estimate_angle_if_possible(det)
         except Exception as e:
             print(f"[WARN] Detector error: {e}")
 
