@@ -441,7 +441,7 @@ def build_argparser() -> argparse.ArgumentParser:
 
     br = p.add_argument_group("Blais-Rioux algorithm")
     br.add_argument("--filter-order", type=int, choices=[2, 4], default=2)
-    br.add_argument("--threshold", type=float, default=15.0)
+    br.add_argument("--threshold", type=float, default=50.0)
     br.add_argument("--min-dist", type=float, default=30.0)
     br.add_argument("--smoothing", type=float, default=0.2)
 

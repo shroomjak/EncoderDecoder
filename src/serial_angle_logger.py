@@ -132,15 +132,12 @@ def run(args: argparse.Namespace) -> None:
                 print(f"[WARN] detect: {exc}", file=sys.stderr)
 
             # Передаём длину undistorted-сигнала — идентично demo_opencv_br:
-            #   angle_est = _estimate_angle_if_possible(det, ..., len(packet.pixels))
+            #   angle_est = _estimate_angle_if_possible(det)
             # но внутри функции sensor_center_px и sensor_width_px считаются
             # от len(det.edge_result.undistorted_signal), поэтому n_pixels
             # должен соответствовать raw пикселям (как в demo_opencv_br).
-            n_pixels = len(pixels)
             angle_est = _estimate_angle_if_possible(
                 det=det,
-                code_sequence=FULL_DISK_CODE_SEQUENCE,
-                n_pixels=n_pixels,
             )
 
             if angle_est is None or angle_est.mean_angle_deg is None:
@@ -201,8 +198,8 @@ def build_argparser() -> argparse.ArgumentParser:
                     help="Порог пиков BR, %% (по умолч. 50)")
     br.add_argument("--min-dist", type=float, default=30.0,
                     help="Мин. расстояние между краями, %% (по умолч. 30)")
-    br.add_argument("--bit-width", type=float, default=6.0, metavar="PX",
-                    help="Ширина бита, пикс. (по умолч. 6)")
+    br.add_argument("--bit-width", type=float, default=6.5, metavar="PX",
+                    help="Ширина бита, пикс. (по умолч. 6.5)")
     br.add_argument("--smoothing", type=float, default=0.2, metavar="SIGMA",
                     help="Сигма сглаживания (по умолч. 0.2)")
 
