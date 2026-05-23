@@ -571,38 +571,6 @@ if __name__ == "__main__":
         x_param="bit_width_px",
         curve_param="filter_order",
         fixed_params={
-            "noise_sigma_adu": 150,
-            "sigma_blur_ratio": 0.2,
-        },
-        param_grid=param_grid,
-    )
-    plot_sigma_1d(
-        stats_df=stats_df,
-        x_param="bit_width_px",
-        curve_param="filter_order",
-        fixed_params={
-            "noise_sigma_adu": 50,
-            "sigma_blur_ratio": 0.2,
-        },
-        param_grid=param_grid,
-    )
-
-    plot_sigma_1d(
-        stats_df=stats_df,
-        x_param="bit_width_px",
-        curve_param="filter_order",
-        fixed_params={
-            "noise_sigma_adu": 0,
-            "sigma_blur_ratio": 0.2,
-        },
-        param_grid=param_grid,
-    )
-
-    plot_sigma_1d(
-        stats_df=stats_df,
-        x_param="bit_width_px",
-        curve_param="filter_order",
-        fixed_params={
             "noise_sigma_adu": 100,
             "sigma_blur_ratio": 0.05,
         },
@@ -624,7 +592,7 @@ if __name__ == "__main__":
         x_param="bit_width_px",
         curve_param="filter_order",
         fixed_params={
-            "noise_sigma_adu": 50,
+            "noise_sigma_adu": 200,
             "sigma_blur_ratio": 0.05,
         },
         param_grid=param_grid,

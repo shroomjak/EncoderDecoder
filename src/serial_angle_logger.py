@@ -33,18 +33,11 @@ from typing import Optional
 import numpy as np
 import serial
 
-from src.blais_rioux import BRConfig, BitRecoveryResult, detect_edges, recover_bits
+from src.blais_rioux import BRConfig
 from src.demo_opencv_br import _estimate_angle_if_possible, _detect_full_width
 from src.disk_angle_estimator import (
-    ANGLE_PERIOD_DEG,
-    CODEWORD_LENGTH_BITS,
     FULL_DISK_CODE_SEQUENCE,
-    TOTAL_CODE_BITS_ON_DISK,
-    AngleEstimationResult,
-    build_code_angle_map,
-    estimate_disk_angle_from_result,
 )
-from src.distortion.math1d import restore_signal_1d
 
 # Зеркало констант из demo_opencv_br (переопределяются через CLI)
 _SENSOR_CENTER_PIXEL: Optional[float] = None   # None → 0.5*(n-1)
@@ -72,13 +65,6 @@ def _parse_serial_line(text: str) -> Optional[tuple[int, np.ndarray]]:
 # ---------------------------------------------------------------------------
 
 def run(args: argparse.Namespace) -> None:
-    # Строим карту кодов один раз
-    code_angle_map = build_code_angle_map(
-        code_sequence=FULL_DISK_CODE_SEQUENCE,
-        total_code_bits=TOTAL_CODE_BITS_ON_DISK,
-        codeword_length=CODEWORD_LENGTH_BITS,
-    )
-
     distort_k = args.distort_k if args.distort_k is not None else _DISTORT_K
 
     br_config = BRConfig(
@@ -205,16 +191,14 @@ def build_argparser() -> argparse.ArgumentParser:
     br = p.add_argument_group("Blais-Rioux")
     br.add_argument("--filter-order", type=int, choices=[2, 4], default=2,
                     help="Порядок фильтра (2 или 4, по умолч. 2)")
-    br.add_argument("--threshold", type=float, default=15.0,
-                    help="Порог пиков BR, %% (по умолч. 15)")
+    br.add_argument("--threshold", type=float, default=50.0,
+                    help="Порог пиков BR, %% (по умолч. 50)")
     br.add_argument("--min-dist", type=float, default=30.0,
                     help="Мин. расстояние между краями, %% (по умолч. 30)")
     br.add_argument("--bit-width", type=float, default=6.0, metavar="PX",
                     help="Ширина бита, пикс. (по умолч. 6)")
     br.add_argument("--smoothing", type=float, default=0.2, metavar="SIGMA",
                     help="Сигма сглаживания (по умолч. 0.2)")
-    br.add_argument("--minmax-window", type=int, default=50, metavar="W",
-                    help="Окно MinMax нормировки (по умолч. 50)")
 
     cor = p.add_argument_group("Distortion")
     cor.add_argument("--distort-k", type=float, default=None,

@@ -8,7 +8,7 @@ visualizer.py — Модуль визуализации через Matplotlib
 4. Первая производная D1 с обозначением фронтов
 5. Вторая производная D2 с обозначением нулей (фронтов)
 
-Панели 3, 4, 5 содержат разметку ROI и истинных положений бит.
+Панели 3, 4, 5 содержат разметку истинных положений бит.
 """
 
 import numpy as np
@@ -114,7 +114,7 @@ def visualize_result(
     gs = gridspec.GridSpec(
         5, 1,
         figure=fig,
-        height_ratios=[0.55, 0.30, 1.0, 1.0, 1.0],
+        height_ratios=[0.55, 0.25, 0.25, 1.0, 1.0, 1.0],
         hspace=0.08,
         left=0.06, right=0.97, top=0.97, bottom=0.06,
     )
@@ -146,14 +146,12 @@ def visualize_result(
             f"Гран. нуля: {det.config.peak_threshold_rel*100:.0f}% | "
             f"Мин. дист.: {det.config.min_edge_distance_factor*100:.0f}%T | "
             f"Сглаж.: {det.config.smoothing_sigma:.1f} | "
-            f"Окно норм.: {det.config.minmax_window_px}",
             "dimgray", 14,
         ),
         (
             f"Точн.: {det.accuracy:.1f}% | Перех.: {len(det.detected_edges)} | "
             f"RMS: {det.rms_edge_error:.3f} px | "
-            f"Ср. T: {det.measured_bit_period:.2f} px ({period_err:+.2f}%) | "
-            f"ROI: [{det.roi_start:.1f} – {det.roi_end:.1f}]",
+            f"Ср. T: {det.measured_bit_period:.2f} px ({period_err:+.2f}%) | ",
             acc_color, 14,
         ),
         (f"{'Истинное:'.ljust(20)} {bits_to_string(sim_result.bits)}", COLOR_CORRECT, 12),
@@ -191,9 +189,29 @@ def visualize_result(
     ax_2d.set_ylabel("ПЗС", fontsize=10, rotation=0, labelpad=26, va="center")
 
     # ===================================================================
+    # 2. Псевдо-2D изображение сигнала без дисторсии
+    # ===================================================================
+    ax_2d = fig.add_subplot(gs[2])
+
+    sig_undist = det.edge_result.undistorted_signal.astype(float)
+    sig_norm = (sig_raw - sig_raw.min()) / (
+                sig_raw.max() - sig_raw.min() + 1e-12)
+    # Растягиваем вертикально (pseudo-2D strip)
+    strip = np.tile(sig_norm[np.newaxis, :], (20, 1))
+    ax_2d.imshow(strip, cmap="gray", aspect="auto",
+                 extent=[-0.5, n_px - 0.5, 0, 1],
+                 origin="upper", vmin=0, vmax=1)
+    ax_2d.set_yticks([])
+    ax_2d.set_xticks([])
+    for spine in ax_2d.spines.values():
+        spine.set_edgecolor("black")
+        spine.set_linewidth(0.8)
+    ax_2d.set_ylabel("ПЗС", fontsize=10, rotation=0, labelpad=26, va="center")
+
+    # ===================================================================
     # 3. Нормализованный + восстановленный сигнал
     # ===================================================================
-    ax_sig = fig.add_subplot(gs[2])
+    ax_sig = fig.add_subplot(gs[3])
 
     _add_roi_and_true_bits(ax_sig, det, sim_result.true_edges)
 
@@ -219,7 +237,6 @@ def visualize_result(
     legend_items = [
         Line2D([0], [0], color=COLOR_LOCAL_NORM, lw=1.4, label="Нормал."),
         Line2D([0], [0], color=COLOR_RECOVERED,  lw=2.5, label="Восстан."),
-        Line2D([0], [0], color=COLOR_ROI,        lw=1.0, ls="--", label="ROI"),
         Line2D([0], [0], color=COLOR_RISING,     lw=1.0, label="Переход 0->1"),
         Line2D([0], [0], color=COLOR_FALLING,    lw=1.0, label="Переход 1->0"),
         Line2D([0], [0], color=COLOR_TRUE_BIT,   lw=0.7, ls=":", label="Истинные границы"),
@@ -230,7 +247,7 @@ def visualize_result(
     # ===================================================================
     # 4. Первая производная D1
     # ===================================================================
-    ax_d1 = fig.add_subplot(gs[3])
+    ax_d1 = fig.add_subplot(gs[4])
 
     _add_roi_and_true_bits(ax_d1, det, sim_result.true_edges)
 
@@ -292,7 +309,6 @@ def visualize_result(
         Line2D([0], [0], color=COLOR_D2,      lw=1.4, label="D2"),
         Line2D([0], [0], color=COLOR_RISING,  lw=1.0, label="Переход 0->1"),
         Line2D([0], [0], color=COLOR_FALLING, lw=1.0, label="Переход 1->0"),
-        Line2D([0], [0], color=COLOR_ROI,     lw=1.0, ls="--", label="ROI"),
         Line2D([0], [0], color=COLOR_TRUE_BIT,lw=0.7, ls=":", label="Истинные биты"),
     ]
     ax_d2.legend(handles=leg_d2, fontsize=8, loc="upper right",
@@ -337,13 +353,11 @@ def print_detailed_results(
     print(
         f"  Min edge distance: {det.config.min_edge_distance_factor * 100:.1f}% of T")
     print(f"  Smoothing sigma: {det.config.smoothing_sigma:.2f} px")
-    print(f"  MinMax window: {det.config.minmax_window_px} px")
 
     print("\n--- DETECTION RESULTS ---")
     print(f"  Detected edges: {len(det.detected_edges)}")
     print(f"  Bit segments: {len(det.bit_segments)}")
     print(f"  Recovered bits: {len(det.recovered_bits)}")
-    print(f"  ROI: [{det.roi_start:.2f} - {det.roi_end:.2f}] px")
     print(f"  A priori bit width: {det.bit_width_px:.2f} px")
     print(f"  Measured period: {det.measured_bit_period:.3f} px")
     period_err = ((
@@ -442,6 +456,5 @@ if __name__ == "__main__":
         min_edge_distance_factor=0.3,
         bit_width_px=7.5,
         smoothing_sigma=0.5,
-        minmax_window_px=20,
     )
     run_visualization(sim_config, br_config)

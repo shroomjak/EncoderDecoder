@@ -71,6 +71,7 @@ def _sensor_center_scale(n: int):
     c = 0.5 * (n - 1)
     return c, max(c, 1.0)
 
+
 def _undistort_and_resample(
     signal: np.ndarray,
     k: float,
@@ -103,22 +104,18 @@ def _undistort_and_resample(
     c, s = _sensor_center_scale(n)
     x_d_norm = (np.arange(n, dtype=np.float64) - c) / s
 
-    # Inverse division model: x_u = 2*x_d / (1 + sqrt(1 - 4*k*x_d^2))
-    disc    = np.clip(1.0 - 4.0 * k * x_d_norm ** 2, 0.0, None)
+    disc     = np.clip(1.0 - 4.0 * k * x_d_norm ** 2, 0.0, None)
     x_u_norm = 2.0 * x_d_norm / (1.0 + np.sqrt(disc))
-    x_u_px   = x_u_norm * s + c  # non-uniform grid in undistorted space
+    x_u_px   = x_u_norm * s + c
 
-    # New uniform grid spanning the same range
-    x_min, x_max = float(x_u_px[0]), float(x_u_px[-1])
+    x_min = float(x_u_px[0])
+    x_max = float(x_u_px[-1])
     m = int(np.floor((x_max - x_min) / output_step_px)) + 1
     x_u_new = np.arange(m, dtype=np.float64) * output_step_px
 
-    # Natural cubic spline interpolation
-    x_u_px_shifted = x_u_px - x_min  # нормируем к [0, x_max - x_min]
-    spline = CubicSpline(x_u_px_shifted, signal, bc_type="natural")
-    undist = spline(x_u_new)
+    spline = CubicSpline(x_u_px - x_min, signal, bc_type="natural")
+    return x_u_new, spline(x_u_new)
 
-    return x_u_new, undist
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -144,12 +141,11 @@ class BRConfig:
     """Gaussian smoothing sigma before differentiation."""
 
     distort_coeff: float = 0.0
-    """Division-model coefficient k. 0 = no correction.
-    When non-zero, the signal is geometry-corrected (N->M, bicubic spline)
-    before all further processing. All subsequent coordinates are M-point."""
+    """Division-model coefficient k. 0 = no correction."""
 
     undist_output_step_px: float = 1.0
     """Output grid step for undistortion (normally 1.0 -- one pixel)."""
+
 
 # ---------------------------------------------------------------------------
 # Data classes
@@ -157,8 +153,9 @@ class BRConfig:
 
 @dataclass
 class DetectedEdge:
-    position:  float   # sub-pixel index in undistorted M-point coordinates
-    d1_value:  float   # D1 at this position (sign = transition direction)
+    position:  float
+    d1_value:  float
+
 
 @dataclass
 class BitSegment:
@@ -170,52 +167,47 @@ class BitSegment:
     measured_period: float
     grid_start_pos:  Optional[float] = None
 
+
 @dataclass
 class RecoveredBit:
     value:       int
-    position:    float   # undistorted pixel index
+    position:    float
     segment_idx: int
+
 
 @dataclass
 class EdgeDetectionResult:
-    """Output of detect_edges().
-
-    raw_signal         -- original ADC values,         length N
-    undistorted_signal -- after bicubic undistortion,  length M  (M >= N)
-    undist_x           -- uniform x-axis for undistorted_signal (pixel units)
-
-    All edge / bit positions are indices 0..M-1 into undistorted_signal.
-    """
-    raw_signal:          np.ndarray   # float64, shape (N,)
-    undistorted_signal:  np.ndarray   # float64, shape (M,)
-    undist_x:            np.ndarray   # float64, shape (M,)
+    """Output of detect_edges()."""
+    raw_signal:          np.ndarray
+    undistorted_signal:  np.ndarray
+    undist_x:            np.ndarray
 
     first_derivative:    np.ndarray
     second_derivative:   np.ndarray
     smoothed_signal:     np.ndarray
-    vignette_norm:   np.ndarray
+    vignette_norm:       np.ndarray
 
     detected_edges:  List[DetectedEdge]
     bit_width_px:    float
     peak_threshold:  float
     config:          BRConfig = field(repr=False)
 
+
 @dataclass
 class BitRecoveryResult:
     """Output of recover_bits()."""
     edge_result: EdgeDetectionResult
 
-    measured_bit_period: float
-    bit_segments:        List[BitSegment]
-    recovered_bits:      List[RecoveredBit]
+    measured_bit_period:  float
+    bit_segments:         List[BitSegment]
+    recovered_bits:       List[RecoveredBit]
     recovered_bit_values: np.ndarray
 
-    bit_errors:    int
-    edge_errors:   np.ndarray
+    bit_errors:     int
+    edge_errors:    np.ndarray
     rms_edge_error: float
-    accuracy:      float
+    accuracy:       float
 
-    # Convenience forwarding from EdgeDetectionResult
     @property
     def raw_signal(self):           return self.edge_result.raw_signal
     @property
@@ -239,6 +231,7 @@ class BitRecoveryResult:
     @property
     def config(self):               return self.edge_result.config
 
+
 # ---------------------------------------------------------------------------
 # DSP primitives
 # ---------------------------------------------------------------------------
@@ -247,12 +240,15 @@ def make_br_kernel(order: int) -> np.ndarray:
     k = np.array([-1] * order + [0] + [1] * order, dtype=np.float64)
     return k / np.sum(np.abs(k))
 
+
 def correlate_mirror(signal: np.ndarray, kernel: np.ndarray) -> np.ndarray:
     return correlate1d(signal, kernel, mode="reflect")
+
 
 def normalize_global(signal: np.ndarray) -> np.ndarray:
     s_min, s_max = signal.min(), signal.max()
     return (signal - s_min) / (s_max - s_min + 1e-12)
+
 
 def apply_minmax_normalization(signal: np.ndarray, window_size: int) -> np.ndarray:
     global_min  = float(signal.min())
@@ -260,31 +256,51 @@ def apply_minmax_normalization(signal: np.ndarray, window_size: int) -> np.ndarr
     local_max   = np.maximum(running_max, 0.5)
     return (signal - global_min) / (local_max - global_min + 1e-12)
 
+
 def find_zero_crossings_d2(d2: np.ndarray, d1: np.ndarray) -> List[DetectedEdge]:
-    """Sub-pixel zero-crossings of D2. Positions are indices 0..M-1."""
+    """
+    Sub-pixel zero-crossings of D2 — fully vectorised.
+    Positions are indices 0..M-1.
+    """
     signs = np.sign(d2)
-    cross = np.where((signs[:-1] * signs[1:]) < 0)[0]
-    edges = []
-    for i in cross:
-        pos  = i + d2[i] / (d2[i] - d2[i + 1])
-        frac = pos - i
-        d1v  = d1[i] * (1 - frac) + d1[i + 1] * frac
-        edges.append(DetectedEdge(position=pos, d1_value=d1v))
-    return edges
+    # Индексы левых точек знакового перехода
+    idx = np.where(signs[:-1] * signs[1:] < 0)[0]
+    if idx.size == 0:
+        return []
+
+    d2_i   = d2[idx]
+    d2_i1  = d2[idx + 1]
+    frac   = d2_i / (d2_i - d2_i1)          # sub-pixel offset [0, 1)
+    pos    = idx + frac                       # sub-pixel position
+    d1_val = d1[idx] * (1.0 - frac) + d1[idx + 1] * frac
+
+    return [DetectedEdge(position=float(p), d1_value=float(v))
+            for p, v in zip(pos, d1_val)]
+
 
 def filter_by_min_distance(
     edges: List[DetectedEdge], min_dist: float
 ) -> List[DetectedEdge]:
+    """
+    Жадный фильтр: при конфликте оставляем ребро с большей амплитудой |D1|.
+    Одна сортировка, один проход.
+    """
     if not edges:
         return []
-    result = [sorted(edges, key=lambda e: e.position)[0]]
-    for curr in sorted(edges, key=lambda e: e.position)[1:]:
-        if curr.position - result[-1].position < min_dist:
-            if abs(curr.d1_value) > abs(result[-1].d1_value):
+
+    sorted_edges = sorted(edges, key=lambda e: e.position)
+    result = [sorted_edges[0]]
+
+    for curr in sorted_edges[1:]:
+        prev = result[-1]
+        if curr.position - prev.position < min_dist:
+            if abs(curr.d1_value) > abs(prev.d1_value):
                 result[-1] = curr
         else:
             result.append(curr)
+
     return result
+
 
 # ---------------------------------------------------------------------------
 # Bit-segment helpers (all in undistorted M-point index space)
@@ -295,14 +311,16 @@ def _estimate_segment_n_bits(visible_distance: float, reference_period: float) -
         return 0
     return max(1, int(np.ceil((visible_distance - 1e-9) / max(reference_period, 1e-12))))
 
+
 def _build_internal_segments(
     edges: List[DetectedEdge],
     bit_width_px: float,
 ) -> List[BitSegment]:
     segs = []
+    half_bw = 0.5 * bit_width_px
     for e, ne in zip(edges[:-1], edges[1:]):
         d = ne.position - e.position
-        if d <= 0.5 * bit_width_px:
+        if d <= half_bw:
             continue
         n = max(1, int(round(d / bit_width_px)))
         segs.append(BitSegment(
@@ -315,10 +333,14 @@ def _build_internal_segments(
         ))
     return segs
 
+
 def _compute_mean_period(segments: List[BitSegment]) -> float:
+    if not segments:
+        return 0.0
     total_p = sum(s.measured_period * s.n_bits for s in segments)
     total_n = sum(s.n_bits for s in segments)
     return total_p / total_n if total_n > 0 else 0.0
+
 
 def build_bit_segments(
     edges: List[DetectedEdge],
@@ -331,9 +353,7 @@ def build_bit_segments(
 
     sorted_edges = sorted(edges, key=lambda e: e.position)
     internal     = _build_internal_segments(sorted_edges, bit_width_px)
-    ref_period   = _compute_mean_period(internal)
-    if ref_period <= 0:
-        ref_period = bit_width_px
+    ref_period   = _compute_mean_period(internal) or bit_width_px
 
     segs: List[BitSegment] = []
 
@@ -371,6 +391,7 @@ def build_bit_segments(
 
     return segs
 
+
 def extract_bits_with_positions(segments: List[BitSegment]) -> List[RecoveredBit]:
     bits = []
     for idx, seg in enumerate(segments):
@@ -378,33 +399,35 @@ def extract_bits_with_positions(segments: List[BitSegment]) -> List[RecoveredBit
             continue
         gs  = seg.grid_start_pos if seg.grid_start_pos is not None else seg.start_pos
         eps = max(1e-9, 1e-6 * seg.measured_period)
+        p   = seg.measured_period
         for i in range(seg.n_bits):
-            bs = gs + i * seg.measured_period
-            be = bs + seg.measured_period
+            bs = gs + i * p
+            be = bs + p
             if bs >= seg.start_pos - eps and be <= seg.end_pos + eps:
-                bits.append(RecoveredBit(value=seg.bit_value, position=bs, segment_idx=idx))
+                bits.append(RecoveredBit(value=seg.bit_value,
+                                         position=bs,
+                                         segment_idx=idx))
     bits.sort(key=lambda b: b.position)
     return bits
+
 
 def compute_mean_measured_period(segments: List[BitSegment]) -> float:
     return _compute_mean_period(segments)
 
+
 # ---------------------------------------------------------------------------
-# Sliding-window bit accuracy
+# Sliding-window bit accuracy — vectorised via stride tricks
 # ---------------------------------------------------------------------------
 
 def _sliding_window_accuracy(
     rec_values: np.ndarray,
-    true_bits: np.ndarray,
+    true_bits:  np.ndarray,
 ) -> tuple[int, float]:
     """
-    Find the best-matching position of rec_values inside true_bits
-    by sliding rec_values over true_bits (or vice versa if rec is longer).
+    Best-match sliding window.
 
-    Returns
-    -------
-    best_err : int    -- number of mismatched bits at best offset
-    accuracy : float  -- percentage of correct bits (0..100)
+    Вместо Python-цикла используем np.lib.stride_tricks для создания
+    матрицы всех окон, после чего считаем совпадения одним вызовом np.sum.
     """
     n_rec  = len(rec_values)
     n_true = len(true_bits)
@@ -416,30 +439,25 @@ def _sliding_window_accuracy(
     true = true_bits.astype(np.int8)
 
     if n_rec <= n_true:
-        # Slide rec over true: for each offset k, count matching bits
-        win = n_rec
+        win       = n_rec
         n_offsets = n_true - win + 1
-        best_matches = 0
-        for k in range(n_offsets):
-            matches = int(np.sum(rec == true[k:k + win]))
-            if matches > best_matches:
-                best_matches = matches
-        best_err = win - best_matches
-        accuracy = best_matches / win * 100.0
+        # shape (n_offsets, win)
+        windows       = np.lib.stride_tricks.sliding_window_view(true, win)
+        matches_all   = np.sum(windows == rec, axis=1)   # (n_offsets,)
+        best_matches  = int(matches_all.max())
+        best_err      = win - best_matches
+        accuracy      = best_matches / win * 100.0
     else:
-        # rec is longer than true: slide true over rec
-        win = n_true
+        win       = n_true
         n_offsets = n_rec - win + 1
-        best_matches = 0
-        for k in range(n_offsets):
-            matches = int(np.sum(true == rec[k:k + win]))
-            if matches > best_matches:
-                best_matches = matches
-        best_err = win - best_matches
-        # accuracy denominator = n_rec (we recovered more bits than ground truth)
-        accuracy = best_matches / n_rec * 100.0
+        windows       = np.lib.stride_tricks.sliding_window_view(rec, win)
+        matches_all   = np.sum(windows == true, axis=1)
+        best_matches  = int(matches_all.max())
+        best_err      = win - best_matches
+        accuracy      = best_matches / n_rec * 100.0
 
     return best_err, accuracy
+
 
 # ---------------------------------------------------------------------------
 # Public API
@@ -449,18 +467,7 @@ def detect_edges(
     adc_signal: np.ndarray,
     config: Optional[BRConfig] = None,
 ) -> EdgeDetectionResult:
-    """
-    Steps 0-8: undistort (N->M, bicubic) -> normalise -> D1/D2 -> edges.
-
-    Step 0 -- geometry-correct undistortion:
-        x_d grid (N px, distorted) -> x_u_new grid (M px, same 1-px scale).
-        M > N for pincushion distortion (k > 0).
-        Interpolation: natural cubic spline.
-        k == 0 => undistorted_signal == raw_signal, M == N.
-
-    All subsequent positions (edges, bits) are indices 0..M-1.
-    No ROI clipping — full signal width is processed.
-    """
+    """Steps 0-8: undistort (N->M) -> normalise -> D1/D2 -> edges."""
     if config is None:
         config = BRConfig()
 
@@ -470,16 +477,15 @@ def detect_edges(
     x_u, undist = _undistort_and_resample(
         raw, config.distort_coeff, config.undist_output_step_px
     )
-
     _, undist_vignette = _undistort_and_resample(
         VIGNETTE, config.distort_coeff, config.undist_output_step_px
     )
-    m = len(undist)
 
     # Steps 1-3
-    sig_norm   = normalize_global(undist)
-    sig_smooth = gaussian_filter1d(sig_norm, sigma=config.smoothing_sigma)
+    sig_norm      = normalize_global(undist)
+    sig_smooth    = gaussian_filter1d(sig_norm, sigma=config.smoothing_sigma)
     vignette_norm = normalize_global(sig_smooth / undist_vignette)
+
     # Steps 4-5
     kernel = make_br_kernel(config.filter_order)
     d1     = correlate_mirror(vignette_norm, kernel)
@@ -516,48 +522,52 @@ def recover_bits(
     true_bits:   np.ndarray,
     true_edges:  np.ndarray,
 ) -> BitRecoveryResult:
-    """
-    Steps 10-15: segments -> bits -> metrics.
+    """Steps 10-15: segments -> bits -> metrics (undistorted M-point space)."""
+    edges = edge_result.detected_edges
+    bw    = edge_result.bit_width_px
+    m     = len(edge_result.undistorted_signal)
 
-    Operates entirely in undistorted M-point index space.
-    true_edges must be in the same (undistorted) coordinates.
-    Processes the full signal width — no ROI clipping.
-    """
-    edges  = edge_result.detected_edges
-    bw     = edge_result.bit_width_px
-    m      = len(edge_result.undistorted_signal)
-
-    # Full signal range (no ROI)
     signal_start = 0.0
     signal_end   = float(m - 1)
 
-    # Step 10
-    segments = build_bit_segments(edges, bw, signal_start, signal_end)
-
-    # Step 11
+    # Step 10-11
+    segments    = build_bit_segments(edges, bw, signal_start, signal_end)
     mean_period = _compute_mean_period(segments)
 
     # Step 12
     rec_bits   = extract_bits_with_positions(segments)
     rec_values = np.array([b.value for b in rec_bits])
 
-    # Steps 13-14 -- bit accuracy via corrected sliding window match
+    # Steps 13-14
     best_err, accuracy = _sliding_window_accuracy(rec_values, true_bits)
 
-    # Step 15 -- edge position errors (in undistorted px)
-    det_pos    = [e.position for e in edges]
-    errs, used = [], set()
-    for te in true_edges:
-        best_d, best_j = float("inf"), -1
-        for j, dp in enumerate(det_pos):
-            if j not in used and abs(dp - te) < best_d:
-                best_d, best_j = abs(dp - te), j
-        if best_j >= 0 and best_d < bw * 0.5:
-            errs.append(det_pos[best_j] - te)
-            used.add(best_j)
+    # Step 15 -- edge position errors via searchsorted (O(N log M))
+    det_pos = np.array([e.position for e in edges])
+    errs    = []
+
+    if det_pos.size > 0:
+        det_sorted  = np.sort(det_pos)
+        used        = np.zeros(len(det_sorted), dtype=bool)
+        half_bw     = bw * 0.5
+
+        for te in true_edges:
+            # Ближайший кандидат по отсортированному массиву
+            j = int(np.searchsorted(det_sorted, te))
+
+            best_d, best_j = float("inf"), -1
+            # Проверяем соседей вокруг точки вставки (обычно достаточно ±1)
+            for jj in (j - 1, j):
+                if 0 <= jj < len(det_sorted) and not used[jj]:
+                    d = abs(det_sorted[jj] - te)
+                    if d < best_d:
+                        best_d, best_j = d, jj
+
+            if best_j >= 0 and best_d < half_bw:
+                errs.append(det_sorted[best_j] - te)
+                used[best_j] = True
 
     errs_arr = np.array(errs)
-    rms      = float(np.sqrt(np.mean(errs_arr ** 2))) if len(errs_arr) > 0 else 0.0
+    rms      = float(np.sqrt(np.mean(errs_arr ** 2))) if errs_arr.size > 0 else 0.0
 
     return BitRecoveryResult(
         edge_result=edge_result,
@@ -578,5 +588,4 @@ def detect_edges_and_recover_bits(
     true_edges: np.ndarray,
     config: Optional[BRConfig] = None,
 ) -> BitRecoveryResult:
-    er = detect_edges(adc_signal, config)
-    return recover_bits(er, true_bits, true_edges)
+    return recover_bits(detect_edges(adc_signal, config), true_bits, true_edges)

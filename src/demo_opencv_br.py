@@ -306,6 +306,7 @@ def _estimate_angle_if_possible(
         detection_result=det,
         code_sequence=code_sequence,
         codeword_length=CODEWORD_LENGTH_BITS,
+        sensor_width_px=len(det.edge_result.undistorted_signal),
         total_code_bits=TOTAL_CODE_BITS_ON_DISK,
         sensor_center_px=sc_px,
         angle_period_deg=ANGLE_PERIOD_DEG,
