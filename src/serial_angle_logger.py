@@ -34,9 +34,10 @@ import numpy as np
 import serial
 
 from src.blais_rioux import BRConfig
-from src.demo_opencv_br import _estimate_angle_if_possible, _detect_full_width
-from src.disk_angle_estimator import (
-    FULL_DISK_CODE_SEQUENCE,
+from src.demo_opencv_br import (
+    _estimate_angle_if_possible,
+    _detect_full_width,
+    matrix_packets,
 )
 
 # Зеркало констант из demo_opencv_br (переопределяются через CLI)
@@ -104,56 +105,39 @@ def run(args: argparse.Namespace) -> None:
     n_ok = n_fail = 0
 
     try:
-        while not _stop[0]:
-            try:
-                raw = ser.readline()
-            except serial.SerialException as exc:
-                print(f"[ERROR] serial: {exc}", file=sys.stderr)
+        for packet in matrix_packets(args):
+            if _stop[0]:
                 break
 
-            if not raw:
-                continue
-
-            parsed = _parse_serial_line(raw.decode("utf-8", errors="ignore"))
-            if parsed is None:
-                continue
-            row_index, pixels = parsed
-
-            pixels = pixels.astype(np.float32)
             det = None
             try:
                 det = _detect_full_width(
-                    pixels,
+                    packet.pixels,
                     np.zeros(args.n_bits, dtype=np.int32),
                     np.array([]),
-                    br_config
+                    br_config,
                 )
             except Exception as exc:
                 print(f"[WARN] detect: {exc}", file=sys.stderr)
 
-            # Передаём длину undistorted-сигнала — идентично demo_opencv_br:
-            #   angle_est = _estimate_angle_if_possible(det)
-            # но внутри функции sensor_center_px и sensor_width_px считаются
-            # от len(det.edge_result.undistorted_signal), поэтому n_pixels
-            # должен соответствовать raw пикселям (как в demo_opencv_br).
-            angle_est = _estimate_angle_if_possible(
-                det=det,
-            )
+            angle_est = _estimate_angle_if_possible(det)
 
             if angle_est is None or angle_est.mean_angle_deg is None:
                 n_fail += 1
-                print(f"[SKIP] row={row_index} (fails={n_fail})",
+                print(f"[SKIP] row={packet.row_index} (fails={n_fail})",
                       flush=True)
                 continue
 
             mean_deg = angle_est.mean_angle_deg
-            std_deg  = angle_est.std_angle_deg if angle_est.std_angle_deg is not None else float("nan")
+            std_deg = angle_est.std_angle_deg if angle_est.std_angle_deg is not None else float(
+                "nan")
 
-            writer.writerow([row_index, f"{mean_deg:.6f}", f"{std_deg:.6f}"])
+            writer.writerow(
+                [packet.row_index, f"{mean_deg:.6f}", f"{std_deg:.6f}"])
             csv_file.flush()
             n_ok += 1
             print(
-                f"[OK]   row={row_index:6d}  "
+                f"[OK]   row={packet.row_index:6d}  "
                 f"angle={mean_deg:8.3f}°  std={std_deg:.4f}°  "
                 f"(wrote={n_ok})",
                 flush=True,

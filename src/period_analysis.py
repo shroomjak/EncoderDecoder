@@ -1,4 +1,3 @@
-# period_fold_analysis.py
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -100,7 +99,6 @@ def trim_constants(x, angle, std, smooth_pct=1.0, threshold_pct=15.0):
     q10, q90 = np.percentile(speed_s, [10, 90])
     thr = q10 + threshold_pct / 100 * (q90 - q10)
     active = speed_s >= max(thr, 1e-9)
-    # заполним мелкие дырки
     for gap in range(1, w + 1):
         active = np.convolve(active.astype(float), np.ones(2*gap+1)/(2*gap+1), mode="same") > 0.5
     idx = np.where(active)[0]
@@ -154,7 +152,7 @@ def _grid(x, period, n_phase, start=None):
 
 
 # ============================================================
-# Fold + детренд + робастная статистика
+# Fold + детрендирование по глобальным координатам + ре-фазировка
 # ============================================================
 def fold_and_detrend(x, angle, std, period, slope_sign, n_phase=None, clip=3.0):
     dx = np.median(np.diff(x))
@@ -164,16 +162,21 @@ def fold_and_detrend(x, angle, std, period, slope_sign, n_phase=None, clip=3.0):
     phase, query = _grid(x, period, n_phase)
     n_per = query.shape[0]
 
-    # fold углов и СКО
-    angle_mat = circ_interp(x, angle, query.ravel()).reshape(n_per, n_phase)
+    # --- FIX 1: интерполируем unwrapped сигнал напрямую, без повторного wrap ---
+    # Это избегает артефактов двойного wrap/unwrap через circ_interp
+    u_global = unwrap_deg(angle)
+    angle_mat_uw = np.interp(query.ravel(), x, u_global).reshape(n_per, n_phase)
+
+    # СКО одиночного измерения интерполируем линейно
     std_mat = np.interp(query.ravel(), x, std).reshape(n_per, n_phase)
 
-    # детренд каждого периода
-    error_mat = np.empty_like(angle_mat)
+    # --- FIX 2: детрендируем по глобальным координатам (query[k]), не по phase ---
+    error_mat = np.empty_like(angle_mat_uw)
     for k in range(n_per):
-        row = unwrap_deg(angle_mat[k])
-        sl, ic, _ = robust_polyfit1(phase, row, clip=clip)
-        error_mat[k] = row - (sl * phase + ic)
+        row = angle_mat_uw[k]           # уже unwrapped, без дополнительного unwrap
+        global_coords = query[k]        # реальные координаты: start + k*period + phase
+        sl, ic, _ = robust_polyfit1(global_coords, row, clip=clip)
+        error_mat[k] = row - (sl * global_coords + ic)
 
     # робастное среднее и СКО по столбцам
     mean_err = np.empty(n_phase)
@@ -204,8 +207,10 @@ def fold_and_detrend(x, angle, std, period, slope_sign, n_phase=None, clip=3.0):
     single_std = np.sqrt(np.mean(std_mat ** 2, axis=0))
     total_std = np.sqrt(stat_std ** 2 + single_std ** 2)
 
-    # пере-фазировка: скачок wrap на границу
-    mean_raw = circ_mean(angle_mat, axis=0)
+    # --- FIX 3: ре-фазировка — сдвигаем и данные, и phase_samples ---
+    # Определяем скачок wrap на границе по wrapped среднему
+    angle_mat_wrapped = wrap_deg(angle_mat_uw)
+    mean_raw = circ_mean(angle_mat_wrapped, axis=0)
     diffs = np.diff(mean_raw)
     if slope_sign >= 0:
         idx = int(np.argmin(diffs))
@@ -216,9 +221,16 @@ def fold_and_detrend(x, angle, std, period, slope_sign, n_phase=None, clip=3.0):
 
     if do_shift:
         sh = idx + 1
+        # Сдвигаем phase_samples циклически, сохраняя монотонность
+        # Новая нулевая точка — phase[sh], диапазон переносится в [0, period)
+        phase_offset = phase[sh]
+        phase = (phase - phase_offset) % period
+        # Сортируем по новой фазе — восстанавливаем монотонность
+        sort_idx = np.argsort(phase)
+        phase = phase[sort_idx]
         for arr in [mean_err, stat_std, single_std, total_std, outlier]:
-            arr[:] = np.roll(arr, -sh)
-        error_mat = np.roll(error_mat, -sh, axis=1)
+            arr[:] = arr[sort_idx]
+        error_mat = error_mat[:, sort_idx]
 
     return PeriodAnalysisResult(
         period_samples=period,
@@ -274,14 +286,13 @@ def plot_result(r: PeriodAnalysisResult, out_path=None):
     ax1.set_ylim([-0.25, 0.25])
     ax1.grid(True, alpha=0.3)
 
-    # --- нижний: СКО ---
     ax2.plot(x, r.single_frame_std, color="tab:blue", label="СКО одиночного")
     ax2.plot(x, r.statistical_std, color="tab:green", label="Стат. СКО между периодами")
     ax2.plot(x, r.total_std, color="tab:orange", label="Суммарное СКО")
     ax2.set_xlabel("Отсчёт внутри периода")
     ax2.set_ylabel("СКО, град")
     ax2.legend(fontsize=8)
-    ax2.set_ylim([0, 0.2])
+    ax2.set_ylim([0, 0.075])
     ax2.grid(True, alpha=0.3)
 
     if out_path:

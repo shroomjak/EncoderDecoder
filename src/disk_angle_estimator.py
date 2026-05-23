@@ -482,4 +482,4 @@ if __name__ == "__main__":
         ANGLE_PERIOD_DEG,
     )
     print("Фильтр 226°..230°")
-    print_code_angle_table(code_map, 226, 230, ANGLE_PERIOD_DEG, True)
+    print_code_angle_table(code_map, 359, 10, ANGLE_PERIOD_DEG, True)
