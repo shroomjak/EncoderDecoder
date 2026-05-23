@@ -8,7 +8,8 @@ disk_angle_estimator.py — расчёт абсолютного угла дис�
 Шаг 2. Извлечение валидных бит, центров и ширин.
 Шаг 3. Скользящие окна: lookup + theta = phi_center - k*(x_center - x0)
 Шаг 4. Вес виньетирования: w(u) = 1 - k*(1 - cos(u*pi/2)^s)
-Шаг 5. Weighted circular mean / std
+Шаг 5. Робастная фильтрация выбросов по циркулярному расстоянию
+Шаг 6. Weighted circular mean / std
 """
 
 from __future__ import annotations
@@ -34,27 +35,10 @@ FULL_DISK_CODE_SEQUENCE = (
     "1101111011111111"
 )
 
-
-"""
-new code lim 7
-FULL_DISK_CODE_SEQUENCE = (
-    "0101010101101010100101010001010110010101110101011110101001101010000101001"
-    "0010100111010110110101100010100011010111001010000010110100101101110100100"
-    "0101100110100110010110000101110110100010010111000101111001011111010111111"
-    "0100111101000111010000110100000010010011011011001001000010011000100111001"
-    "0011111011011110110011101100011011000001000100011001000111101110111001101"
-    "11000010000111011110001000001101111100111000000"
-)
-"""
-
 TOTAL_CODE_BITS_ON_DISK = len(FULL_DISK_CODE_SEQUENCE)
 CODEWORD_LENGTH_BITS = 9
 ANGLE_PERIOD_DEG = 360.0
 
-
-# ---------------------------------------------------------------------------
-# Структуры данных
-# ---------------------------------------------------------------------------
 
 @dataclass
 class AngleWindowSample:
@@ -85,12 +69,26 @@ class AngleEstimationResult:
     std_angle_deg: Optional[float] = None
 
 
-# ---------------------------------------------------------------------------
-# Углы
-# ---------------------------------------------------------------------------
-
 def wrap_angle_deg(angle_deg: float, angle_period_deg: float = 360.0) -> float:
     return float(angle_deg % angle_period_deg)
+
+
+def signed_angle_diff_deg(
+    a_deg: float,
+    b_deg: float,
+    angle_period_deg: float = 360.0,
+) -> float:
+    half = 0.5 * angle_period_deg
+    return float((a_deg - b_deg + half) % angle_period_deg - half)
+
+
+def angular_distance_deg(
+    a_deg: float | np.ndarray,
+    b_deg: float | np.ndarray,
+    angle_period_deg: float = 360.0,
+) -> float | np.ndarray:
+    return np.abs((np.asarray(a_deg) - np.asarray(b_deg) + 0.5 * angle_period_deg)
+                  % angle_period_deg - 0.5 * angle_period_deg)
 
 
 def angle_in_range_deg(
@@ -117,11 +115,13 @@ def circular_mean_deg(
     wsum = w.sum()
     if wsum <= 1e-12:
         return None
+
     phase = a * (2.0 * np.pi / angle_period_deg)
     s = np.dot(w, np.sin(phase))
     c = np.dot(w, np.cos(phase))
     if abs(s) <= 1e-12 and abs(c) <= 1e-12:
         return None
+
     mp = np.arctan2(s, c)
     if mp < 0:
         mp += 2.0 * np.pi
@@ -140,18 +140,75 @@ def circular_std_deg(
     wsum = w.sum()
     if wsum <= 1e-12:
         return None
+
     phase = a * (2.0 * np.pi / angle_period_deg)
     s = np.dot(w, np.sin(phase))
     c = np.dot(w, np.cos(phase))
     r = min(np.hypot(s, c) / wsum, 1.0 - 1e-15)
     if r <= 1e-12:
         return None
+
     return float(np.sqrt(-2.0 * np.log(r)) * angle_period_deg / (2.0 * np.pi))
 
 
-# ---------------------------------------------------------------------------
-# Кодовая карта
-# ---------------------------------------------------------------------------
+def robust_circular_inlier_mask(
+    angles_deg: np.ndarray,
+    weights: Optional[np.ndarray] = None,
+    angle_period_deg: float = 360.0,
+    sigma_thresh: float = 2.5,
+    max_iter: int = 3,
+    min_keep: int = 3,
+    min_std_deg: float = 0.25,
+) -> np.ndarray:
+    """
+    Робастная фильтрация выбросов на окружности.
+
+    Выброс определяется не по abs(a - mean), а по минимальному дуговому
+    расстоянию до текущего circular mean. Это корректно работает в окрестности
+    0°/360°.
+    """
+    a = np.asarray(angles_deg, dtype=np.float64)
+    if a.size == 0:
+        return np.zeros(0, dtype=bool)
+
+    w = np.ones_like(a) if weights is None else np.asarray(weights, dtype=np.float64)
+    alive = np.isfinite(a) & np.isfinite(w) & (w > 1e-15)
+
+    if alive.sum() <= min_keep:
+        return alive
+
+    for _ in range(max_iter):
+        idx = np.where(alive)[0]
+        if idx.size <= min_keep:
+            break
+
+        mu = circular_mean_deg(a[idx], weights=w[idx], angle_period_deg=angle_period_deg)
+        if mu is None:
+            break
+
+        d = angular_distance_deg(a[idx], mu, angle_period_deg=angle_period_deg)
+        sigma = circular_std_deg(a[idx], weights=w[idx], angle_period_deg=angle_period_deg)
+
+        if sigma is None:
+            break
+
+        sigma_eff = max(float(sigma), float(min_std_deg))
+        keep_local = d <= sigma_thresh * sigma_eff
+
+        if keep_local.all():
+            break
+        if keep_local.sum() < min_keep:
+            break
+
+        new_alive = np.zeros_like(alive)
+        new_alive[idx[keep_local]] = True
+
+        if np.array_equal(new_alive, alive):
+            break
+        alive = new_alive
+
+    return alive
+
 
 def build_code_angle_map(
     code_sequence: str,
@@ -172,7 +229,6 @@ def build_code_angle_map(
     delta = angle_period_deg / total_code_bits
     half_m = codeword_length * 0.5
 
-    # Удвоенная строка для циклического slice без %
     doubled = seq + seq
     code_map: Dict[str, dict] = {}
     duplicates: Dict[str, List[int]] = {}
@@ -210,7 +266,9 @@ def print_code_angle_table(
     idx_hdr = f"{'StartIdx':>8} | " if show_start_bit_index else ""
     header = f"  {'lo°':>13} | {'center°':>14} | {'hi°':>14} | {idx_hdr}{'Код':>{w}}"
     sep = "-" * len(header)
-    print(sep); print(header); print(sep)
+    print(sep)
+    print(header)
+    print(sep)
 
     for cw, e in sorted(code_angle_map.items(),
                          key=lambda kv: kv[1]["angle_center_deg"] % angle_period_deg):
@@ -225,10 +283,6 @@ def print_code_angle_table(
     print(sep)
 
 
-# ---------------------------------------------------------------------------
-# Основная функция
-# ---------------------------------------------------------------------------
-
 def estimate_disk_angle_from_result(
     detection_result: "BitRecoveryResult",
     code_sequence: str,
@@ -239,10 +293,13 @@ def estimate_disk_angle_from_result(
     angle_period_deg: float = 360.0,
     vignetting_k: float = 0.75,
     vignetting_s: float = 0.5,
+    outlier_sigma_thresh: float = 2.5,
+    outlier_max_iter: int = 3,
+    outlier_min_keep: int = 3,
+    outlier_min_std_deg: float = 0.25,
 ) -> AngleEstimationResult:
     m = codeword_length
 
-    # --- Шаг 1. Масштаб ---
     total_px = 0.0
     total_n = 0
     for seg in detection_result.bit_segments:
@@ -255,8 +312,12 @@ def estimate_disk_angle_from_result(
     mean_period_px = (total_px / total_n) if total_n > 0 else None
 
     result = AngleEstimationResult(
-        codeword_length=m, visible_bits=0, total_windows=0, matched_windows=0,
-        mean_bit_period_px=mean_period_px, reverse_direction=REVERSE_AXIS_SIGN,
+        codeword_length=m,
+        visible_bits=0,
+        total_windows=0,
+        matched_windows=0,
+        mean_bit_period_px=mean_period_px,
+        reverse_direction=REVERSE_AXIS_SIGN,
     )
 
     if mean_period_px is None or mean_period_px <= 1e-12:
@@ -266,11 +327,9 @@ def estimate_disk_angle_from_result(
     angle_per_px = delta_phi / mean_period_px
     result.angle_per_px_deg = angle_per_px
 
-    # --- Карта ---
     eff_seq = code_sequence[::-1] if REVERSE_AXIS_SIGN else code_sequence
     code_map = build_code_angle_map(eff_seq, total_code_bits, m, angle_period_deg)
 
-    # --- Шаг 2. Биты ---
     bit_values: List[int] = []
     bit_centers_px: List[float] = []
     bit_widths_px: List[float] = []
@@ -282,11 +341,13 @@ def estimate_disk_angle_from_result(
         pp = float(seg.measured_period)
         if pp <= 1e-12:
             continue
+
         bs = float(rb.position)
         be = bs + pp
         eps = max(1e-9, 1e-6 * pp)
         if bs < float(seg.start_pos) - eps or be > float(seg.end_pos) + eps:
             continue
+
         bit_values.append(int(rb.value))
         bit_centers_px.append(bs + 0.5 * pp)
         bit_widths_px.append(pp)
@@ -302,11 +363,11 @@ def estimate_disk_angle_from_result(
     centers = np.asarray(bit_centers_px, dtype=np.float64)
     widths = np.asarray(bit_widths_px, dtype=np.float64)
 
-    # --- Центры окон через cumsum (O(n) вместо O(n*m)) ---
     wc = widths * centers
     cum_wc = np.empty(n_bits + 1, dtype=np.float64)
     cum_w = np.empty(n_bits + 1, dtype=np.float64)
-    cum_wc[0] = 0.0; cum_w[0] = 0.0
+    cum_wc[0] = 0.0
+    cum_w[0] = 0.0
     np.cumsum(wc, out=cum_wc[1:])
     np.cumsum(widths, out=cum_w[1:])
 
@@ -314,9 +375,8 @@ def estimate_disk_angle_from_result(
     sum_w = cum_w[m:m + n_win] - cum_w[:n_win]
     valid_w = sum_w > 1e-12
     safe_w = np.where(valid_w, sum_w, 1.0)
-    x_win_all = sum_wc / safe_w  # центры всех окон
+    x_win_all = sum_wc / safe_w
 
-    # --- Шаг 3. Lookup ---
     bit_chars = "".join(str(v) for v in bit_values)
 
     matched_s: List[int] = []
@@ -343,12 +403,11 @@ def estimate_disk_angle_from_result(
     phi_arr = np.array(matched_phi, dtype=np.float64)
     x_centers = x_win_all[idx_arr]
 
-    # theta = phi - k * (x - x0), затем wrap
     theta_arr = (phi_arr - angle_per_px * (x_centers - sensor_center_px)) % angle_period_deg
 
-    # --- Шаг 4. Виньетирование (векторное) ---
     sensor_half_w = sensor_width_px * 0.5
-    u = (x_centers - sensor_center_px) / sensor_half_w if sensor_half_w > 1e-12 else np.full(n_matched, 2.0)
+    u = ((x_centers - sensor_center_px) / sensor_half_w
+         if sensor_half_w > 1e-12 else np.full(n_matched, 2.0))
     inside = np.abs(u) <= 1.0
 
     if vignetting_k <= 1e-15:
@@ -356,11 +415,29 @@ def estimate_disk_angle_from_result(
     else:
         cos_val = np.cos(u * (np.pi * 0.5))
         cos_pow = np.abs(cos_val) ** vignetting_s if vignetting_s > 1e-15 else np.ones(n_matched)
-        w_vign = np.where(inside, np.maximum(0.0, 1.0 - vignetting_k * (1.0 - cos_pow)), 0.0)
+        w_vign = np.where(
+            inside,
+            np.maximum(0.0, 1.0 - vignetting_k * (1.0 - cos_pow)),
+            0.0,
+        )
 
-    alive = w_vign > 1e-15
+    alive_vign = w_vign > 1e-15
+    if not np.any(alive_vign):
+        return result
 
-    # --- Сборка samples ---
+    alive_robust_local = robust_circular_inlier_mask(
+        theta_arr[alive_vign],
+        weights=w_vign[alive_vign],
+        angle_period_deg=angle_period_deg,
+        sigma_thresh=outlier_sigma_thresh,
+        max_iter=outlier_max_iter,
+        min_keep=outlier_min_keep,
+        min_std_deg=outlier_min_std_deg,
+    )
+
+    alive = np.zeros(n_matched, dtype=bool)
+    alive[np.where(alive_vign)[0][alive_robust_local]] = True
+
     samples: List[AngleWindowSample] = []
     for i in range(n_matched):
         if alive[i]:
@@ -380,12 +457,19 @@ def estimate_disk_angle_from_result(
     if not samples:
         return result
 
-    # --- Шаг 5. Weighted circular mean / std ---
     final_angles = theta_arr[alive]
     final_weights = w_vign[alive]
 
-    result.mean_angle_deg = circular_mean_deg(final_angles, weights=final_weights, angle_period_deg=angle_period_deg)
-    result.std_angle_deg = circular_std_deg(final_angles, weights=final_weights, angle_period_deg=angle_period_deg)
+    result.mean_angle_deg = circular_mean_deg(
+        final_angles,
+        weights=final_weights,
+        angle_period_deg=angle_period_deg,
+    )
+    result.std_angle_deg = circular_std_deg(
+        final_angles,
+        weights=final_weights,
+        angle_period_deg=angle_period_deg,
+    )
 
     return result
 
