@@ -8,7 +8,14 @@
   4. Определение границ ПОЛНЫХ периодов и отбрасывание неполных.
   5. Fold полных периодов на единую фазовую ось.
   6. Глобальный линейный детренд → матрица ошибок.
-  7. Робастная статистика (среднее, СКО между периодами, СКО одиночного).
+  7. Статистика: mean и std по периодам (поточечно).
+
+Ключевые особенности:
+  - Неполные периоды в начале и конце данных полностью исключаются.
+  - Границы периодов определяются по пересечению линейного тренда с N×360°.
+  - Фазовая сетка сдвинута на полшага, чтобы не попадать на границы.
+  - Глобальный (единый) детренд для всех периодов.
+  - Отсечение выбросов — на уровне целых периодов (опционально).
 """
 
 from __future__ import annotations
@@ -38,11 +45,12 @@ class PeriodAnalysisResult:
     total_std: np.ndarray       # sqrt(stat² + single²), град
 
     error_matrix: np.ndarray    # ошибки всех периодов после детренда (n_periods × n_phase)
-    outlier_mask: np.ndarray    # True = фазовая точка с выбросами
+    period_mask: np.ndarray     # True = период использован в статистике
 
     fitted_slope: float         # град/отсчёт (знак = направление)
     rotation_direction: str     # "increasing" / "decreasing"
     active_range: Tuple[float, float]  # [x_start, x_end] активного участка
+    period_boundaries: np.ndarray  # x-координаты границ периодов
 
 
 # ============================================================
@@ -61,19 +69,18 @@ def unwrap_deg(a: np.ndarray) -> np.ndarray:
     return np.rad2deg(np.unwrap(np.deg2rad(a)))
 
 
-def circ_mean(a: np.ndarray, axis: int = 0) -> np.ndarray:
-    z = np.exp(1j * np.deg2rad(a))
-    return wrap_deg(np.rad2deg(np.angle(np.mean(z, axis=axis))))
-
-
 # ============================================================
 # Робастный линейный fit (итеративный, MAD-based)
 # ============================================================
 def robust_polyfit1(x: np.ndarray, y: np.ndarray,
                     clip: float = 3.0, n_iter: int = 5):
     """Возвращает (slope, intercept, inlier_mask)."""
+    if len(x) < 2:
+        raise ValueError("Недостаточно точек для fit")
+
     mask = np.ones(len(x), dtype=bool)
     slope, intercept = np.polyfit(x, y, 1)
+
     for _ in range(n_iter):
         r = y - (slope * x + intercept)
         med = np.median(r[mask])
@@ -86,6 +93,7 @@ def robust_polyfit1(x: np.ndarray, y: np.ndarray,
             break
         mask = mask_new
         slope, intercept = np.polyfit(x[mask], y[mask], 1)
+
     return slope, intercept, mask
 
 
@@ -137,9 +145,8 @@ def trim_constants(x: np.ndarray, angle: np.ndarray, std: np.ndarray,
         return x, angle, std
 
     # speed имеет длину N-1, speed[i] соответствует интервалу [x[i], x[i+1]].
-    # Если speed[i] активна, нам нужны точки i и i+1.
-    s = idx[0]          # первый активный интервал начинается в точке s
-    e = idx[-1] + 1     # последний активный интервал заканчивается в точке e
+    s = idx[0]
+    e = idx[-1] + 1
     e = min(e, len(x) - 1)
 
     return x[s:e + 1], angle[s:e + 1], std[s:e + 1]
@@ -156,10 +163,11 @@ def estimate_period(x: np.ndarray, angle: np.ndarray,
     Грубая оценка периода по наклону unwrapped сигнала + уточнение
     по минимуму дисперсии при фолдинге.
 
-    Возвращает (period, slope_sign).
+    Возвращает (period, slope).
     """
     u = unwrap_deg(angle)
-    slope, _, _ = robust_polyfit1(x, u)
+    slope, intercept, _ = robust_polyfit1(x, u)
+
     if abs(slope) < 1e-12:
         raise ValueError("Наклон сигнала ≈ 0, невозможно определить период")
 
@@ -169,118 +177,115 @@ def estimate_period(x: np.ndarray, angle: np.ndarray,
     lo = max(p0 * (1 - refine_frac), span / (n_hint * 2))
     hi = min(p0 * (1 + refine_frac), span / max(n_hint / 2, 1))
     if lo >= hi:
-        return p0, np.sign(slope)
+        return p0, slope
 
     dx = np.median(np.diff(x))
     nph = int(np.clip(p0 / dx, 64, 512))
 
-    best_p, best_s = p0, np.inf
+    best_p, best_score = p0, np.inf
+
     for p in np.linspace(lo, hi, refine_n):
-        # Для уточнения — берём только полные периоды внутри данных
-        n_full = int((x[-1] - x[0]) / p)
+        n_full = int((span - dx) / p)
         if n_full < 2:
             continue
-        phase = np.linspace(0, p, nph, endpoint=False)
-        starts = x[0] + np.arange(n_full) * p
-        query = starts[:, None] + phase[None, :]  # (n_full, nph)
 
-        # Все точки query гарантированно в [x[0], x[0] + n_full*p] ⊆ [x[0], x[-1]]
-        mat_uw = np.interp(query.ravel(), x, u).reshape(n_full, nph)
+        phase_frac = (np.arange(nph) + 0.5) / nph
+        offset = (span - n_full * p) / 2
+        starts = x[0] + offset + np.arange(n_full) * p
+        query_x = starts[:, None] + phase_frac[None, :] * p
 
-        # Детренд каждого периода (вычитаем линейный тренд)
-        for k in range(n_full):
-            row_x = query[k]
-            row_y = mat_uw[k]
-            sl = np.polyfit(row_x, row_y, 1)
-            mat_uw[k] = row_y - np.polyval(sl, row_x)
+        if query_x.min() < x[0] or query_x.max() > x[-1]:
+            continue
 
-        # Дисперсия между периодами в каждой фазовой точке
-        sc = np.mean(np.var(mat_uw, axis=0, ddof=1))
-        if sc < best_s:
-            best_s, best_p = sc, p
+        mat_uw = np.interp(query_x.ravel(), x, u).reshape(n_full, nph)
+        trend = slope * query_x + intercept
+        errors = mat_uw - trend
+        score = np.mean(np.var(errors, axis=0, ddof=1))
 
-    return best_p, np.sign(slope)
+        if score < best_score:
+            best_score, best_p = score, p
+
+    return best_p, slope
 
 
 # ============================================================
-# Нахождение границ полных периодов (через пересечение порога)
+# Определение границ полных периодов
 # ============================================================
-def find_full_periods(x: np.ndarray, angle: np.ndarray,
-                      period: float, slope_sign: float) -> np.ndarray:
+def find_period_boundaries(x: np.ndarray, slope: float, intercept: float) -> np.ndarray:
     """
-    Определяет границы полных периодов пилообразного сигнала.
-
-    Полный период = один полный пробег от 0° до 360° (или от 360° до 0°).
-
-    Возвращает массив x-координат начал полных периодов (длина = n_full_periods).
-    Каждый полный период: [starts[i], starts[i] + period).
+    Находит x-координаты границ периодов (где u = N × 360°).
+    Возвращает только те границы, которые строго внутри данных.
     """
-    u = unwrap_deg(angle)
-    slope, intercept, _ = robust_polyfit1(x, u)
-
-    # Начало первого полного периода: первый x, где unwrapped фаза
-    # пересекает границу 360° после x[0]
-    # Фаза внутри периода: phi(x) = (u(x) - u(x0)) mod 360
-    # Первый полный период начинается в точке, где phi = 0 (после начального неполного)
-
-    # Проще: используем линейное приближение для определения начал.
-    # u(x) ≈ slope * x + intercept
-    # Границы периодов: u = intercept + slope*x = N*360 для целых N
-    # => x_N = (N*360 - intercept) / slope
-
-    if abs(slope) < 1e-12:
-        raise ValueError("Наклон ≈ 0")
-
-    # Номера периодов, покрывающих диапазон данных
     u_start = slope * x[0] + intercept
     u_end = slope * x[-1] + intercept
 
     if slope > 0:
-        n_start = int(np.ceil(u_start / 360.0))
-        n_end = int(np.floor(u_end / 360.0))
+        first_n = int(np.ceil(u_start / 360.0))
+        last_n = int(np.floor(u_end / 360.0))
+        if first_n > last_n:
+            return np.array([])
+        boundary_ns = np.arange(first_n, last_n + 1)
     else:
-        n_start = int(np.floor(u_start / 360.0))
-        n_end = int(np.ceil(u_end / 360.0))
+        first_n = int(np.floor(u_start / 360.0))
+        last_n = int(np.ceil(u_end / 360.0))
+        if first_n < last_n:
+            return np.array([])
+        boundary_ns = np.arange(first_n, last_n - 1, -1)
 
-    if slope > 0:
-        period_boundary_ns = np.arange(n_start, n_end + 1)
-    else:
-        period_boundary_ns = np.arange(n_end, n_start + 1)
+    boundary_x = (boundary_ns * 360.0 - intercept) / slope
 
-    # x-координаты границ периодов (по линейному приближению)
-    boundary_x = (period_boundary_ns * 360.0 - intercept) / slope
-
-    # Оставляем только те границы, которые внутри данных с запасом
-    mask = (boundary_x >= x[0]) & (boundary_x <= x[-1])
+    eps = (x[-1] - x[0]) * 1e-6
+    mask = (boundary_x >= x[0] + eps) & (boundary_x <= x[-1] - eps)
     boundary_x = boundary_x[mask]
 
-    if len(boundary_x) < 2:
-        raise ValueError(f"Недостаточно полных периодов (границ: {len(boundary_x)})")
+    return np.sort(boundary_x)
 
-    # Уточняем границы по реальным данным (ищем ближайшие точки пересечения)
-    boundary_x_refined = []
-    for bx in boundary_x:
-        idx = np.argmin(np.abs(x - bx))
-        boundary_x_refined.append(x[idx])
 
-    boundary_x_refined = np.array(boundary_x_refined)
+# ============================================================
+# Отсечение выбросных периодов (целиком)
+# ============================================================
+def filter_outlier_periods(error_mat: np.ndarray, clip: float = 3.0) -> np.ndarray:
+    """
+    Определяет, какие периоды являются выбросами.
+    Критерий: RMS ошибки периода отличается от медианы более чем на clip*MAD.
 
-    return boundary_x_refined
+    Возвращает маску: True = период OK, False = выброс.
+    """
+    n_periods = error_mat.shape[0]
+    if n_periods < 3:
+        return np.ones(n_periods, dtype=bool)
+
+    # RMS ошибки для каждого периода
+    rms_per_period = np.sqrt(np.mean(error_mat ** 2, axis=1))
+
+    med = np.median(rms_per_period)
+    mad = np.median(np.abs(rms_per_period - med))
+    sigma = max(1.4826 * mad, 1e-12)
+
+    mask = np.abs(rms_per_period - med) <= clip * sigma
+
+    # Гарантируем минимум 2 периода
+    if np.count_nonzero(mask) < 2:
+        return np.ones(n_periods, dtype=bool)
+
+    return mask
 
 
 # ============================================================
 # Fold полных периодов + глобальный детренд + статистика
 # ============================================================
 def fold_and_detrend(x: np.ndarray, angle: np.ndarray, std: np.ndarray,
-                     period: float, slope_sign: float,
+                     period: float, slope_hint: float,
                      n_phase: int | None = None,
-                     clip: float = 3.0) -> PeriodAnalysisResult:
+                     clip: float = 3.0,
+                     filter_periods: bool = True) -> PeriodAnalysisResult:
     """
     Основная функция анализа:
       1. Находит полные периоды (неполные отбрасываются).
       2. Интерполирует каждый полный период на единую фазовую сетку.
       3. Вычитает ГЛОБАЛЬНЫЙ линейный тренд.
-      4. Считает робастные статистики по фазовым точкам.
+      4. Опционально отсекает выбросные периоды целиком.
+      5. Считает mean и std по периодам поточечно.
     """
     dx = np.median(np.diff(x))
     if n_phase is None:
@@ -288,34 +293,10 @@ def fold_and_detrend(x: np.ndarray, angle: np.ndarray, std: np.ndarray,
 
     u_global = unwrap_deg(angle)
     slope_val, intercept_val, _ = robust_polyfit1(x, u_global, clip=clip)
+    slope_sign = np.sign(slope_val)
 
-    # --- 1. Определяем начала полных периодов ---
-    # Полные периоды: начало_i = x[0] + offset + i * period
-    # offset выбирается так, чтобы первый полный период целиком лежал внутри данных,
-    # и последний тоже.
-
-    # Вместо сложного поиска пересечений используем простой подход:
-    # Фаза точки x относительно линейного приближения:
-    #   phi(x) = (slope_val * x + intercept_val) mod 360
-    # Начало периода: phi = 0
-    # По линейному приближению: первое x где phi проходит через 0
-
-    u_start = slope_val * x[0] + intercept_val
-    u_end = slope_val * x[-1] + intercept_val
-
-    if slope_val > 0:
-        first_boundary_n = int(np.ceil(u_start / 360.0))
-        last_boundary_n = int(np.floor(u_end / 360.0))
-        boundary_ns = np.arange(first_boundary_n, last_boundary_n + 1)
-    else:
-        first_boundary_n = int(np.floor(u_start / 360.0))
-        last_boundary_n = int(np.ceil(u_end / 360.0))
-        boundary_ns = np.arange(first_boundary_n, last_boundary_n - 1, -1)
-
-    boundary_x = (boundary_ns * 360.0 - intercept_val) / slope_val
-    # Оставляем только те, что строго внутри данных
-    mask = (boundary_x >= x[0]) & (boundary_x <= x[-1])
-    boundary_x = np.sort(boundary_x[mask])
+    # --- 1. Определяем границы полных периодов ---
+    boundary_x = find_period_boundaries(x, slope_val, intercept_val)
 
     if len(boundary_x) < 2:
         raise ValueError(
@@ -323,23 +304,20 @@ def fold_and_detrend(x: np.ndarray, angle: np.ndarray, std: np.ndarray,
             f"Найдено границ: {len(boundary_x)}, нужно >= 2."
         )
 
-    # Полные периоды: от boundary_x[i] до boundary_x[i+1]
     n_periods = len(boundary_x) - 1
     period_starts = boundary_x[:-1]
     period_ends = boundary_x[1:]
 
-    # Фактический период — среднее расстояние между границами
     actual_periods = np.diff(boundary_x)
     period_refined = np.median(actual_periods)
 
-    print(f"  Границ периодов найдено: {len(boundary_x)}")
+    print(f"  Границ периодов: {len(boundary_x)}")
     print(f"  Полных периодов: {n_periods}")
-    print(f"  Разброс длин периодов: "
-          f"{actual_periods.min():.2f} .. {actual_periods.max():.2f} "
-          f"(медиана {period_refined:.2f})")
+    print(f"  Длины периодов: {actual_periods.min():.4f} .. {actual_periods.max():.4f} "
+          f"(медиана {period_refined:.4f})")
 
-    # --- 2. Фазовая сетка ---
-    phase_frac = np.linspace(0, 1, n_phase, endpoint=False)  # 0..1
+    # --- 2. Фазовая сетка (центры бинов) ---
+    phase_frac = (np.arange(n_phase) + 0.5) / n_phase
 
     # --- 3. Интерполяция каждого полного периода ---
     angle_mat = np.empty((n_periods, n_phase))
@@ -351,60 +329,48 @@ def fold_and_detrend(x: np.ndarray, angle: np.ndarray, std: np.ndarray,
         xe = period_ends[k]
         local_period = xe - xs
 
-        # Абсолютные x-координаты для фазовых точек этого периода
         query_x = xs + phase_frac * local_period
         query_x_mat[k] = query_x
 
-        # Интерполяция unwrapped угла и std
         angle_mat[k] = np.interp(query_x, x, u_global)
         std_mat[k] = np.interp(query_x, x, std)
 
     # --- 4. Глобальный линейный детренд ---
-    # Вычитаем из каждой точки её ожидаемое значение по глобальному fit
     trend = slope_val * query_x_mat + intercept_val
-    error_mat = angle_mat - trend  # (n_periods, n_phase) — ошибки в градусах
+    error_mat = angle_mat - trend
 
-    # --- 5. Робастная статистика по каждой фазовой точке ---
-    mean_err = np.empty(n_phase)
-    stat_std = np.empty(n_phase)
-    outlier = np.zeros(n_phase, dtype=bool)
+    # --- 5. Отсечение выбросных периодов (целиком) ---
+    if filter_periods and n_periods >= 3:
+        period_mask = filter_outlier_periods(error_mat, clip=clip)
+        n_outliers = np.count_nonzero(~period_mask)
+        if n_outliers > 0:
+            print(f"  Отсечено периодов-выбросов: {n_outliers}")
+    else:
+        period_mask = np.ones(n_periods, dtype=bool)
 
-    for j in range(n_phase):
-        col = error_mat[:, j]
-        col_mask = np.ones(n_periods, dtype=bool)
+    # --- 6. Простой расчёт mean и std по валидным периодам ---
+    valid_errors = error_mat[period_mask]
+    valid_stds = std_mat[period_mask]
+    n_valid = valid_errors.shape[0]
 
-        # Итеративное отсечение выбросов
-        for _ in range(5):
-            vals = col[col_mask]
-            if len(vals) < 2:
-                break
-            med = np.median(vals)
-            mad = np.median(np.abs(vals - med))
-            s = max(1.4826 * mad, 1e-12)
-            col_mask_new = np.abs(col - med) <= clip * s
-            if np.count_nonzero(col_mask_new) < 2:
-                break
-            if np.array_equal(col_mask, col_mask_new):
-                break
-            col_mask = col_mask_new
+    mean_err = np.mean(valid_errors, axis=0)
 
-        n_inliers = np.count_nonzero(col_mask)
-        mean_err[j] = np.mean(col[col_mask])
-        stat_std[j] = np.std(col[col_mask], ddof=1) if n_inliers > 1 else 0.0
-        if np.count_nonzero(~col_mask) > 0:
-            outlier[j] = True
+    if n_valid > 1:
+        stat_std = np.std(valid_errors, axis=0, ddof=1)
+    else:
+        stat_std = np.zeros(n_phase)
 
-    # --- 6. СКО одиночного измерения (среднеквадратичное по периодам) ---
-    single_std = np.sqrt(np.mean(std_mat ** 2, axis=0))
+    # СКО одиночного измерения (RMS по периодам)
+    single_std = np.sqrt(np.mean(valid_stds ** 2, axis=0))
     total_std = np.sqrt(stat_std ** 2 + single_std ** 2)
 
     # --- 7. Фазовая ось в градусах ---
     phase_samples = phase_frac * period_refined
-    if slope_sign >= 0:
-        phase_deg = phase_frac * 360.0
-    else:
-        phase_deg = (1.0 - phase_frac) * 360.0
-        # Переупорядочиваем по возрастанию phase_deg
+    phase_deg = phase_frac * 360.0
+
+    # Для убывающего сигнала инвертируем ось
+    if slope_sign < 0:
+        phase_deg = 360.0 - phase_frac * 360.0
         sort_idx = np.argsort(phase_deg)
         phase_deg = phase_deg[sort_idx]
         phase_samples = phase_samples[sort_idx]
@@ -412,23 +378,23 @@ def fold_and_detrend(x: np.ndarray, angle: np.ndarray, std: np.ndarray,
         stat_std = stat_std[sort_idx]
         single_std = single_std[sort_idx]
         total_std = total_std[sort_idx]
-        outlier = outlier[sort_idx]
         error_mat = error_mat[:, sort_idx]
 
     return PeriodAnalysisResult(
         period_samples=period_refined,
-        n_periods=n_periods,
+        n_periods=n_valid,
         phase_samples=phase_samples,
         phase_deg=phase_deg,
         mean_error=mean_err,
         statistical_std=stat_std,
         single_frame_std=single_std,
         total_std=total_std,
-        error_matrix=error_mat,
-        outlier_mask=outlier,
+        error_matrix=error_mat[period_mask],
+        period_mask=period_mask,
         fitted_slope=slope_val,
         rotation_direction="increasing" if slope_sign >= 0 else "decreasing",
         active_range=(float(x[0]), float(x[-1])),
+        period_boundaries=boundary_x,
     )
 
 
@@ -440,28 +406,28 @@ def analyze(csv_path: str, sep: str = ",",
             min_p: float | None = None,
             max_p: float | None = None,
             n_phase: int | None = None,
-            clip: float = 3.0) -> PeriodAnalysisResult:
+            clip: float = 3.0,
+            filter_periods: bool = True) -> PeriodAnalysisResult:
 
     x, angle, std = read_csv(csv_path, sep=sep)
     print(f"Загружено точек: {len(x)}")
 
     x, angle, std = trim_constants(x, angle, std)
-    print(f"После trim_constants: {len(x)} точек, "
-          f"x ∈ [{x[0]:.1f}, {x[-1]:.1f}]")
+    print(f"После trim_constants: {len(x)} точек, x ∈ [{x[0]:.1f}, {x[-1]:.1f}]")
 
-    period, slope_sign = estimate_period(x, angle, n_hint=n_hint)
-    print(f"Оценка периода: {period:.4f} отсч., "
-          f"направление: {'↑' if slope_sign > 0 else '↓'}")
+    period, slope = estimate_period(x, angle, n_hint=n_hint)
+    print(f"Оценка периода: {period:.4f} отсч., slope = {slope:.6f}°/отсч")
 
     if min_p and period < min_p:
-        print(f"  Период {period:.2f} < min_p={min_p}, корректируем")
+        print(f"  Корректировка: {period:.2f} → {min_p}")
         period = min_p
     if max_p and period > max_p:
-        print(f"  Период {period:.2f} > max_p={max_p}, корректируем")
+        print(f"  Корректировка: {period:.2f} → {max_p}")
         period = max_p
 
-    return fold_and_detrend(x, angle, std, period, slope_sign,
-                            n_phase=n_phase, clip=clip)
+    return fold_and_detrend(x, angle, std, period, slope,
+                            n_phase=n_phase, clip=clip,
+                            filter_periods=filter_periods)
 
 
 # ============================================================
@@ -469,45 +435,55 @@ def analyze(csv_path: str, sep: str = ",",
 # ============================================================
 def plot_result(r: PeriodAnalysisResult, out_path: str | None = None):
     ph = r.phase_deg
-    fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(12, 8),
-                                   sharex=True, constrained_layout=True)
+    fig, axes = plt.subplots(3, 1, figsize=(12, 10),
+                             sharex=True, constrained_layout=True)
 
-    # --- Верхний график: средняя ошибка ± СКО ---
+    ax1, ax2, ax3 = axes
+
+    # --- График 1: средняя ошибка ± СКО ---
     ax1.fill_between(ph,
                      r.mean_error - r.total_std,
                      r.mean_error + r.total_std,
-                     color="tab:orange", alpha=0.2, label="± суммарное СКО")
+                     color="tab:orange", alpha=0.2, label="± total СКО")
     ax1.fill_between(ph,
-                     r.mean_error - r.single_frame_std,
-                     r.mean_error + r.single_frame_std,
-                     color="tab:blue", alpha=0.3, label="± СКО одиночного")
+                     r.mean_error - r.statistical_std,
+                     r.mean_error + r.statistical_std,
+                     color="tab:green", alpha=0.3, label="± stat СКО")
     ax1.plot(ph, r.mean_error, "k", lw=2, label="Средняя ошибка")
     ax1.axhline(0, color="gray", lw=0.5, ls="--")
-    ax1.set_ylabel("Ошибка энкодера, град")
+    ax1.set_ylabel("Ошибка, град")
     ax1.set_title(
         f"Период = {r.period_samples:.4f} отсч. | "
-        f"N = {r.n_periods} полных периодов | "
-        f"{r.rotation_direction}"
+        f"N = {r.n_periods} периодов | {r.rotation_direction}"
     )
-    ax1.legend(fontsize=8)
+    ax1.legend(fontsize=8, loc="upper right")
     ax1.set_xlim(0, 360)
-    ax1.set_ylim(-0.5, 0.5)
+    ax1.set_ylim(-0.1, 0.15)
     ax1.grid(True, alpha=0.3)
 
-    # --- Нижний график: СКО ---
-    ax2.plot(ph, r.single_frame_std, color="tab:blue",
-             label="СКО одиночного")
-    ax2.plot(ph, r.statistical_std, color="tab:green",
-             label="Стат. СКО между периодами")
-    ax2.plot(ph, r.total_std, color="tab:orange",
-             label="Суммарное СКО")
-    ax2.set_xlabel("Угол внутри периода, град")
+    # --- График 2: СКО ---
+    ax2.plot(ph, r.single_frame_std, color="tab:blue", label="инстр. СКО")
+    ax2.plot(ph, r.statistical_std, color="tab:green", label="стат. СКО")
+    ax2.plot(ph, r.total_std, color="tab:orange", label="полное СКО")
     ax2.set_ylabel("СКО, град")
-    ax2.legend(fontsize=8)
+    ax2.legend(fontsize=8, loc="upper right")
     ax2.set_xlim(0, 360)
-    ax2.set_ylim(0, 0.5)
-    ax2.set_xticks(np.arange(0, 361, 30))
+    ax2.set_ylim(0, 0.1)
     ax2.grid(True, alpha=0.3)
+
+    # --- График 3: overlay периодов ---
+    n_show = min(r.n_periods, 20)
+    for k in range(n_show):
+        ax3.plot(ph, r.error_matrix[k], alpha=0.8, lw=0.5)
+    ax3.plot(ph, r.mean_error, "k", lw=2, label="mean")
+    ax3.axhline(0, color="gray", lw=0.5, ls="--")
+    ax3.set_xlabel("Фаза, град")
+    ax3.set_ylabel("Ошибка, град")
+    ax3.set_title(f"Отдельные периоды")
+    ax3.set_xlim(0, 360)
+    ax3.set_ylim(-0.15, 0.15)
+    ax3.set_xticks(np.arange(0, 361, 30))
+    ax3.grid(True, alpha=0.3)
 
     if out_path:
         fig.savefig(out_path, dpi=150, bbox_inches="tight")
@@ -519,13 +495,12 @@ def plot_result(r: PeriodAnalysisResult, out_path: str | None = None):
 # ============================================================
 def save_csv(r: PeriodAnalysisResult, path: str):
     pd.DataFrame({
-        "sample_in_period": r.phase_samples,
-        "angle_deg": r.phase_deg,
+        "phase_samples": r.phase_samples,
+        "phase_deg": r.phase_deg,
         "mean_error_deg": r.mean_error,
         "stat_std_deg": r.statistical_std,
         "single_std_deg": r.single_frame_std,
         "total_std_deg": r.total_std,
-        "outlier": r.outlier_mask.astype(int),
     }).to_csv(path, index=False)
 
 
@@ -537,15 +512,14 @@ def main():
         description="Анализ периодического сигнала абсолютного энкодера"
     )
     p.add_argument("csv", help="Входной CSV: index, angle, std")
-    p.add_argument("--sep", default=",", help="Разделитель CSV")
-    p.add_argument("--n-hint", type=float, default=10.0,
-                   help="Ожидаемое кол-во периодов (подсказка)")
+    p.add_argument("--sep", default=",")
+    p.add_argument("--n-hint", type=float, default=10.0)
     p.add_argument("--min-period", type=float, default=None)
     p.add_argument("--max-period", type=float, default=None)
-    p.add_argument("--n-phase", type=int, default=None,
-                   help="Кол-во фазовых точек (авто если не задано)")
-    p.add_argument("--clip", type=float, default=3.0,
-                   help="Порог отсечения выбросов (в σ)")
+    p.add_argument("--n-phase", type=int, default=None)
+    p.add_argument("--clip", type=float, default=3.0)
+    p.add_argument("--no-filter", action="store_true",
+                   help="Не отсекать выбросные периоды")
     p.add_argument("--plot", default="encoder_profile.png")
     p.add_argument("--out-csv", default="encoder_profile.csv")
     p.add_argument("--no-show", action="store_true")
@@ -553,17 +527,21 @@ def main():
 
     r = analyze(a.csv, sep=a.sep, n_hint=a.n_hint,
                 min_p=a.min_period, max_p=a.max_period,
-                n_phase=a.n_phase, clip=a.clip)
+                n_phase=a.n_phase, clip=a.clip,
+                filter_periods=not a.no_filter)
 
-    print(f"\n=== Результат ===")
-    print(f"Период:       {r.period_samples:.4f} отсч.")
-    print(f"Направление:  {r.rotation_direction}")
-    print(f"Периодов:     {r.n_periods}")
-    print(f"Фазовых точек: {len(r.phase_deg)}")
-    print(f"Выбросов:     {np.count_nonzero(r.outlier_mask)}/{len(r.outlier_mask)}")
-    print(f"Макс |ошибка|: {np.max(np.abs(r.mean_error)):.6f}°")
-    print(f"RMS ошибки:   {np.sqrt(np.mean(r.mean_error**2)):.6f}°")
-    print(f"Медиана стат. СКО: {np.median(r.statistical_std):.6f}°")
+    print(f"\n{'='*50}")
+    print(f"РЕЗУЛЬТАТ")
+    print(f"{'='*50}")
+    print(f"Период:          {r.period_samples:.4f} отсч.")
+    print(f"Направление:     {r.rotation_direction}")
+    print(f"Периодов:        {r.n_periods}")
+    print(f"Фазовых точек:   {len(r.phase_deg)}")
+    print(f"Max |ошибка|:    {np.max(np.abs(r.mean_error)):.6f}°")
+    print(f"RMS ошибки:      {np.sqrt(np.mean(r.mean_error**2)):.6f}°")
+    print(f"Медиана stat СКО:   {np.median(r.statistical_std):.6f}°")
+    print(f"Медиана single СКО: {np.median(r.single_frame_std):.6f}°")
+    print(f"{'='*50}")
 
     save_csv(r, a.out_csv)
     plot_result(r, out_path=a.plot)

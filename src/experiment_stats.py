@@ -560,7 +560,7 @@ if __name__ == "__main__":
         x_param="bit_width_px",
         curve_param="filter_order",
         fixed_params={
-            "noise_sigma_adu": 100,
+            "noise_sigma_adu": 200,
             "sigma_blur_ratio": 0.2,
         },
         param_grid=param_grid,
@@ -571,39 +571,7 @@ if __name__ == "__main__":
         x_param="bit_width_px",
         curve_param="filter_order",
         fixed_params={
-            "noise_sigma_adu": 100,
-            "sigma_blur_ratio": 0.05,
-        },
-        param_grid=param_grid,
-    )
-
-    plot_sigma_1d(
-        stats_df=stats_df,
-        x_param="bit_width_px",
-        curve_param="filter_order",
-        fixed_params={
-            "noise_sigma_adu": 150,
-            "sigma_blur_ratio": 0.05,
-        },
-        param_grid=param_grid,
-    )
-    plot_sigma_1d(
-        stats_df=stats_df,
-        x_param="bit_width_px",
-        curve_param="filter_order",
-        fixed_params={
             "noise_sigma_adu": 200,
-            "sigma_blur_ratio": 0.05,
-        },
-        param_grid=param_grid,
-    )
-
-    plot_sigma_1d(
-        stats_df=stats_df,
-        x_param="bit_width_px",
-        curve_param="filter_order",
-        fixed_params={
-            "noise_sigma_adu": 0,
             "sigma_blur_ratio": 0.05,
         },
         param_grid=param_grid,
@@ -627,6 +595,18 @@ if __name__ == "__main__":
         fixed_params={
             "bit_width_px": 6.2,
             "filter_order": 2,
+        },
+        value_col="sigma_mean",
+        param_grid=param_grid,
+    )
+
+    plot_quality_heatmap(
+        stats_df=stats_df,
+        x_param="noise_sigma_adu",
+        y_param="sigma_blur_ratio",
+        fixed_params={
+            "bit_width_px": 6.2,
+            "filter_order": 4,
         },
         value_col="sigma_mean",
         param_grid=param_grid,

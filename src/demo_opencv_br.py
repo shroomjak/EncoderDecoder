@@ -33,6 +33,8 @@ from src.blais_rioux import (
     BitRecoveryResult,
     detect_edges,
     recover_bits,
+    DISTORT_K_1,
+    DISTORT_K_2
 )
 from src.disk_angle_estimator import (
     AngleEstimationResult,
@@ -46,8 +48,6 @@ from src.distortion.math1d import restore_signal_1d
 SENSOR_CENTER_PIXEL = None
 ANGLE_PER_SENSOR_PIXEL_DEG = None
 ENABLE_ANGLE_ESTIMATION = True
-DISTORT_K: float = 0.05
-
 
 @dataclass
 class FramePacket:
